@@ -78,9 +78,9 @@ app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-)
+).format = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")._fmt  # keep consistent format
 
 TRUE_SET = {"1", "true", "yes", "on", "y", "t"}
 
@@ -462,6 +462,7 @@ def _clear_outgoing_pending() -> None:
         _PENDING_UNTIL_TS = None
 
 def _is_outgoing_pending() -> bool:
+    global _PENDING_UNTIL_TS
     with _PENDING_LOCK:
         if _PENDING_UNTIL_TS is None:
             return False
@@ -997,6 +998,8 @@ def api_call_now():
         return jsonify(ok=False, reason="cap_reached", wait_seconds=wait_s), 429
     if _is_call_busy():
         return jsonify(ok=False, reason="already_in_progress", message="A call is already in progress."), 409
+    # Mark pending immediately to reflect state to UI and prevent overlap before Twilio callbacks
+    _mark_outgoing_pending()
     _manual_call_requested.set()
     return jsonify(ok=True)
 
