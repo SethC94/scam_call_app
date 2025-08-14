@@ -157,6 +157,186 @@
   function show(el) { el.classList.remove("hidden"); }
   function hide(el) { el.classList.add("hidden"); }
 
+  // Enhanced API functions for new features
+  async function apiPut(url, data = {}) {
+    const res = await fetch(url, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data)
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  // Toast notification system
+  function showToast(message, type = "success") {
+    const container = document.getElementById("toastContainer");
+    const toast = document.createElement("div");
+    toast.className = `toast ${type}`;
+    toast.textContent = message;
+    
+    container.appendChild(toast);
+    
+    // Auto-remove after 5 seconds
+    setTimeout(() => {
+      if (toast.parentNode === container) {
+        container.removeChild(toast);
+      }
+    }, 5000);
+  }
+
+  // Modal management
+  function showModal(modalId) {
+    document.getElementById(modalId).classList.remove("hidden");
+  }
+
+  function hideModal(modalId) {
+    document.getElementById(modalId).classList.add("hidden");
+  }
+
+  // Admin state
+  let isAdminLoggedIn = false;
+
+  // Admin functionality
+  async function checkAdminStatus() {
+    try {
+      const config = await apiGet("/api/admin/config");
+      isAdminLoggedIn = true;
+      updateAdminButton();
+    } catch {
+      isAdminLoggedIn = false;
+      updateAdminButton();
+    }
+  }
+
+  function updateAdminButton() {
+    const btn = document.getElementById("adminBtn");
+    if (isAdminLoggedIn) {
+      btn.textContent = "Admin (Logged In)";
+      btn.style.background = "#14b89a";
+      btn.style.color = "#04221f";
+    } else {
+      btn.textContent = "Admin";
+      btn.style.background = "#0f2a29";
+      btn.style.color = "#9ff3d7";
+    }
+  }
+
+  async function adminLogin(username, password) {
+    try {
+      await apiPost("/api/admin/login", { username, password });
+      isAdminLoggedIn = true;
+      updateAdminButton();
+      hideModal("adminLoginModal");
+      showToast("Admin login successful");
+      if (document.getElementById("adminSettingsModal").classList.contains("hidden")) {
+        showAdminSettings();
+      }
+    } catch (error) {
+      showToast("Login failed: Invalid credentials", "error");
+    }
+  }
+
+  async function adminLogout() {
+    try {
+      await apiPost("/api/admin/logout");
+      isAdminLoggedIn = false;
+      updateAdminButton();
+      hideModal("adminSettingsModal");
+      showToast("Logged out successfully");
+    } catch (error) {
+      showToast("Logout failed", "error");
+    }
+  }
+
+  async function showAdminSettings() {
+    if (!isAdminLoggedIn) {
+      showModal("adminLoginModal");
+      return;
+    }
+
+    try {
+      const response = await apiGet("/api/admin/config");
+      const config = response.config;
+      
+      const tableEl = document.getElementById("configTable");
+      tableEl.innerHTML = "";
+      
+      // Create table
+      const table = document.createElement("table");
+      table.style.width = "100%";
+      table.style.borderCollapse = "collapse";
+      
+      // Header
+      const headerRow = table.insertRow();
+      headerRow.innerHTML = "<th style='padding: 8px; border: 1px solid rgba(255,255,255,0.2); text-align: left;'>Key</th><th style='padding: 8px; border: 1px solid rgba(255,255,255,0.2); text-align: left;'>Value</th>";
+      
+      // Rows for each config item
+      for (const [key, value] of Object.entries(config)) {
+        const row = table.insertRow();
+        const keyCell = row.insertCell();
+        const valueCell = row.insertCell();
+        
+        keyCell.style.cssText = "padding: 8px; border: 1px solid rgba(255,255,255,0.2);";
+        valueCell.style.cssText = "padding: 8px; border: 1px solid rgba(255,255,255,0.2);";
+        
+        keyCell.textContent = key;
+        
+        const input = document.createElement("input");
+        input.type = "text";
+        input.value = value;
+        input.dataset.key = key;
+        input.style.cssText = "width: 100%; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2); color: #d4f1f9; padding: 4px; border-radius: 4px;";
+        
+        valueCell.appendChild(input);
+      }
+      
+      tableEl.appendChild(table);
+      showModal("adminSettingsModal");
+    } catch (error) {
+      showToast("Failed to load admin settings", "error");
+    }
+  }
+
+  async function saveAdminSettings() {
+    const inputs = document.querySelectorAll("#configTable input[data-key]");
+    const updates = {};
+    
+    for (const input of inputs) {
+      updates[input.dataset.key] = input.value;
+    }
+    
+    try {
+      const response = await apiPut("/api/admin/config", { updates });
+      showToast(`Settings saved successfully. Updated: ${response.saved.join(", ")}`);
+    } catch (error) {
+      showToast("Failed to save settings", "error");
+    }
+  }
+
+  // Greeting phrase functionality
+  function updateWordCount() {
+    const textarea = document.getElementById("greetingPhrase");
+    const wordCountEl = document.getElementById("wordCount");
+    const words = textarea.value.trim().split(/\s+/).filter(w => w.length > 0);
+    const count = words.length;
+    
+    wordCountEl.textContent = `Word count: ${count}`;
+    wordCountEl.style.color = (count >= 5 && count <= 15) ? "#87f7cf" : "#ff6b6b";
+  }
+
+  async function submitGreetingPhrase(phrase) {
+    try {
+      await apiPost("/api/scamcalls/next-greeting", { phrase });
+      hideModal("greetingModal");
+      showToast("Greeting phrase added for next call");
+      document.getElementById("greetingPhrase").value = "";
+      updateWordCount();
+    } catch (error) {
+      showToast("Failed to add greeting phrase", "error");
+    }
+  }
+
   function initLivePage() {
     const cdPanel = document.getElementById("countdownPanel");
     const callPanel = document.getElementById("callPanel");
@@ -173,11 +353,26 @@
       callNowBtn.addEventListener("click", async () => {
         try {
           callNowBtn.disabled = true;
-          await apiPost("/api/scamcalls/call-now");
+          const response = await fetch("/api/scamcalls/call-now", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" }
+          });
+          
+          if (response.status === 429) {
+            const errorData = await response.json();
+            if (errorData.error === "cap") {
+              showToast(errorData.message || "Max calls reached in alloted time. Dont over scam the scammer!", "error");
+            }
+          } else if (response.ok) {
+            // Success - no need to show toast for normal behavior
+          } else {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          
           setTimeout(() => { callNowBtn.disabled = false; }, 3000);
-        } catch {
+        } catch (error) {
           callNowBtn.disabled = false;
-          alert("Failed to request a call. Please try again.");
+          showToast("Failed to request a call. Please try again.", "error");
         }
       });
     }
@@ -371,6 +566,98 @@
     // Initial kick-off and periodic refresh
     refreshStatus();
     state.pollTimer = setInterval(refreshStatus, 5000);
+    
+    // Initialize admin functionality
+    checkAdminStatus();
+    
+    // Event listeners for new buttons
+    const adminBtn = document.getElementById("adminBtn");
+    const addGreetingBtn = document.getElementById("addGreetingBtn");
+    
+    if (adminBtn) {
+      adminBtn.addEventListener("click", () => {
+        if (isAdminLoggedIn) {
+          showAdminSettings();
+        } else {
+          showModal("adminLoginModal");
+        }
+      });
+    }
+    
+    if (addGreetingBtn) {
+      addGreetingBtn.addEventListener("click", () => {
+        showModal("greetingModal");
+      });
+    }
+    
+    // Admin login modal handlers
+    const adminLoginForm = document.getElementById("adminLoginForm");
+    const adminLoginCancel = document.getElementById("adminLoginCancel");
+    
+    if (adminLoginForm) {
+      adminLoginForm.addEventListener("submit", (e) => {
+        e.preventDefault();
+        const username = document.getElementById("adminUsername").value;
+        const password = document.getElementById("adminPassword").value;
+        adminLogin(username, password);
+      });
+    }
+    
+    if (adminLoginCancel) {
+      adminLoginCancel.addEventListener("click", () => {
+        hideModal("adminLoginModal");
+      });
+    }
+    
+    // Admin settings modal handlers
+    const adminLogoutBtn = document.getElementById("adminLogoutBtn");
+    const adminSettingsCancel = document.getElementById("adminSettingsCancel");
+    const adminSettingsSave = document.getElementById("adminSettingsSave");
+    
+    if (adminLogoutBtn) {
+      adminLogoutBtn.addEventListener("click", adminLogout);
+    }
+    
+    if (adminSettingsCancel) {
+      adminSettingsCancel.addEventListener("click", () => {
+        hideModal("adminSettingsModal");
+      });
+    }
+    
+    if (adminSettingsSave) {
+      adminSettingsSave.addEventListener("click", saveAdminSettings);
+    }
+    
+    // Greeting phrase modal handlers
+    const greetingForm = document.getElementById("greetingForm");
+    const greetingCancel = document.getElementById("greetingCancel");
+    const greetingPhrase = document.getElementById("greetingPhrase");
+    
+    if (greetingForm) {
+      greetingForm.addEventListener("submit", (e) => {
+        e.preventDefault();
+        const phrase = document.getElementById("greetingPhrase").value.trim();
+        const words = phrase.split(/\s+/).filter(w => w.length > 0);
+        
+        if (words.length < 5 || words.length > 15) {
+          showToast("Phrase must be 5-15 words", "error");
+          return;
+        }
+        
+        submitGreetingPhrase(phrase);
+      });
+    }
+    
+    if (greetingCancel) {
+      greetingCancel.addEventListener("click", () => {
+        hideModal("greetingModal");
+      });
+    }
+    
+    if (greetingPhrase) {
+      greetingPhrase.addEventListener("input", updateWordCount);
+      updateWordCount(); // Initialize word count
+    }
   }
 
   function initHistoryPage() {

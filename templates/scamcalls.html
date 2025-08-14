@@ -6,11 +6,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="icon" href="/static/favicon.ico" sizes="any" />
     <style>
-      body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; background: #0b1820; color: #d4f1f9; }
-      header { display: flex; align-items: center; justify-content: space-between; padding: 16px 24px; border-bottom: 1px solid rgba(255,255,255,0.06); }
+      body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; background: #0b1820; color: #d4f1f9; position: relative; }
+      header { display: flex; align-items: center; justify-content: space-between; padding: 16px 24px; border-bottom: 1px solid rgba(255,255,255,0.06); position: relative; z-index: 10; }
       header .title { font-weight: 600; }
-      header nav a { color: #87f7cf; margin-left: 16px; text-decoration: none; }
-      main { padding: 24px; }
+      header nav { display: flex; align-items: center; gap: 16px; }
+      header nav a { color: #87f7cf; text-decoration: none; }
+      main { padding: 24px; position: relative; z-index: 10; }
       .panel { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.07); border-radius: 12px; padding: 24px; }
       .hidden { display: none; }
       .status-dot { width: 10px; height: 10px; border-radius: 50%; background: #1a3; box-shadow: 0 0 8px #1a3; }
@@ -33,14 +34,32 @@
       footer { margin-top: 16px; opacity: 0.7; font-size: 12px; }
       .caps { font-variant-numeric: tabular-nums; }
       .inline { display: inline-flex; align-items: center; gap: 8px; }
+      
+      /* Modal styles */
+      .modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+      .modal-content { background: #0f2a29; border: 1px solid rgba(255,255,255,0.15); border-radius: 12px; padding: 24px; min-width: 400px; max-width: 600px; }
+      .modal h3 { margin: 0 0 16px 0; color: #87f7cf; }
+      .modal label { display: block; color: #d4f1f9; margin-bottom: 4px; }
+      .modal input, .modal textarea { background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2); color: #d4f1f9; border-radius: 4px; padding: 8px; }
+      .modal input:focus, .modal textarea:focus { outline: none; border-color: #87f7cf; }
+      
+      /* Toast styles */
+      #toastContainer { position: fixed; top: 20px; right: 20px; z-index: 2000; }
+      .toast { background: #14b89a; color: #04221f; padding: 12px 16px; border-radius: 8px; margin-bottom: 8px; max-width: 300px; word-wrap: break-word; }
+      .toast.error { background: #dc3545; color: white; }
+      
+      /* Matrix background */
+      #matrixCanvas { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; opacity: 0.1; pointer-events: none; }
     </style>
   </head>
   <body data-page="scamcalls">
+    <canvas id="matrixCanvas"></canvas>
     <header>
       <div class="title">Scam Call Monitor</div>
       <nav>
         <a href="/scamcalls" aria-current="page">Live</a>
         <a href="/scamcalls/history">History</a>
+        <button id="adminBtn" class="button" type="button">Admin</button>
       </nav>
     </header>
 
@@ -75,6 +94,7 @@
               </div>
               <div style="display:flex; flex-direction:column; gap:8px;">
                 <button id="callNowBtn" class="button primary" type="button">Call now</button>
+                <button id="addGreetingBtn" class="button" type="button">Add greeting phrase</button>
                 <div style="font-size: 12px; opacity: 0.8;">Served via: <span id="publicUrl">auto</span></div>
               </div>
             </div>
@@ -100,8 +120,68 @@
           <div id="appStatus">Status: Initializing...</div>
         </footer>
       </div>
+      
+      <!-- Admin Login Modal -->
+      <div id="adminLoginModal" class="modal hidden">
+        <div class="modal-content">
+          <h3>Admin Login</h3>
+          <form id="adminLoginForm">
+            <div style="margin-bottom: 16px;">
+              <label for="adminUsername">Username:</label>
+              <input type="text" id="adminUsername" name="username" required style="width: 100%; padding: 8px; margin-top: 4px; border: 1px solid rgba(255,255,255,0.2); background: rgba(0,0,0,0.3); color: #d4f1f9; border-radius: 4px;">
+            </div>
+            <div style="margin-bottom: 16px;">
+              <label for="adminPassword">Password:</label>
+              <input type="password" id="adminPassword" name="password" required style="width: 100%; padding: 8px; margin-top: 4px; border: 1px solid rgba(255,255,255,0.2); background: rgba(0,0,0,0.3); color: #d4f1f9; border-radius: 4px;">
+            </div>
+            <div style="display: flex; gap: 8px; justify-content: flex-end;">
+              <button type="button" id="adminLoginCancel" class="button">Cancel</button>
+              <button type="submit" class="button primary">Login</button>
+            </div>
+          </form>
+        </div>
+      </div>
+      
+      <!-- Admin Settings Modal -->
+      <div id="adminSettingsModal" class="modal hidden">
+        <div class="modal-content">
+          <h3>Admin Settings</h3>
+          <div id="adminSettingsContent">
+            <div style="margin-bottom: 16px;">
+              <button id="adminLogoutBtn" class="button">Logout</button>
+            </div>
+            <div id="configTable"></div>
+            <div style="display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px;">
+              <button type="button" id="adminSettingsCancel" class="button">Close</button>
+              <button type="button" id="adminSettingsSave" class="button primary">Save Changes</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Greeting Phrase Modal -->
+      <div id="greetingModal" class="modal hidden">
+        <div class="modal-content">
+          <h3>Add Greeting Phrase</h3>
+          <form id="greetingForm">
+            <div style="margin-bottom: 16px;">
+              <label for="greetingPhrase">Greeting phrase (5-15 words):</label>
+              <textarea id="greetingPhrase" name="phrase" required style="width: 100%; padding: 8px; margin-top: 4px; border: 1px solid rgba(255,255,255,0.2); background: rgba(0,0,0,0.3); color: #d4f1f9; border-radius: 4px; min-height: 80px;"></textarea>
+              <div id="wordCount" style="font-size: 12px; opacity: 0.8; margin-top: 4px;">Word count: 0</div>
+            </div>
+            <div style="display: flex; gap: 8px; justify-content: flex-end;">
+              <button type="button" id="greetingCancel" class="button">Cancel</button>
+              <button type="submit" class="button primary">Add Phrase</button>
+            </div>
+          </form>
+        </div>
+      </div>
+      
+      <!-- Toast Container -->
+      <div id="toastContainer"></div>
     </main>
 
+    <script src="/static/matrix.js"></script>
     <script src="/static/scamcalls.js"></script>
   </body>
 </html>

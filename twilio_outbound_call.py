@@ -41,7 +41,7 @@ except Exception:
 # Ensure pyngrok uses local binary if set (optional)
 os.environ.setdefault("NGROK_PATH", "/opt/homebrew/bin/ngrok")
 
-from flask import Flask, request, Response, render_template, jsonify, send_from_directory
+from flask import Flask, request, Response, render_template, jsonify, send_from_directory, session
 
 # WebSockets
 try:
@@ -80,6 +80,7 @@ except Exception:
 
 # Flask app and WebSocket sock
 app = Flask(__name__)
+app.secret_key = os.getenv("SECRET_KEY", "dev-secret-change-in-production")  # For session management
 sock = Sock(app)
 
 # Globals
@@ -213,6 +214,32 @@ _last_random_index: Optional[int] = None
 # Live audio: connected browser clients
 _audio_clients_lock = threading.Lock()
 _audio_clients: Set[Any] = set()  # set of WebSocket objects
+
+# Admin functionality
+_ADMIN_USERNAME = "bootycall"
+_ADMIN_PASSWORD = "scammers"
+_SECRET_KEYS = {
+    "TWILIO_AUTH_TOKEN", "TWILIO_ACCOUNT_SID", "SECRET_KEY", "NGROK_AUTHTOKEN"
+}
+_SECRET_PATTERNS = {"TOKEN", "SECRET", "KEY", "PASS", "PASSWORD", "PRIVATE", "SID"}
+
+# One-time greeting phrase storage
+_next_greeting_phrase: Optional[str] = None
+_greeting_phrase_lock = threading.Lock()
+
+def _is_secret_key(key: str) -> bool:
+    """Check if a key should be treated as secret and not exposed/editable."""
+    key_upper = key.upper()
+    if key_upper in _SECRET_KEYS:
+        return True
+    for pattern in _SECRET_PATTERNS:
+        if pattern in key_upper:
+            return True
+    return False
+
+def _is_admin() -> bool:
+    """Check if current session is authenticated as admin."""
+    return session.get("is_admin", False) is True
 
 
 def setup_logging() -> None:
@@ -358,7 +385,7 @@ def _finalize_transcript(call_sid: str) -> str:
     if full_text:
         logging.info("\n%s\n%s\n%s", header, full_text, footer)
     else:
-        logging.info("\%s\n%s\n%s", header, "<no speech captured>", footer)
+        logging.info("\\%s\n%s\n%s", header, "<no speech captured>", footer)
     return full_text
 
 
@@ -852,9 +879,23 @@ def wait_for_callee_handler() -> Response:
             st["fsm_state"] = "GREET_AND_PROMPT"
 
     # Compose initial lines: greeting + optional consent + rotating prompt.
+    # Check for one-time greeting phrase first
+    greeting_phrase = None
+    with _greeting_phrase_lock:
+        global _next_greeting_phrase
+        if _next_greeting_phrase:
+            greeting_phrase = _next_greeting_phrase
+            _next_greeting_phrase = None  # Clear after use
+    
     prompt_line = _assign_prompt_if_needed(call_sid) or _default_prompt_text()
     lines = []
-    lines.append(f"Hello. This is an automated assistant from {_COMPANY_NAME}.")
+    
+    # Add custom greeting phrase if provided, otherwise use default
+    if greeting_phrase:
+        lines.append(greeting_phrase)
+    else:
+        lines.append(f"Hello. This is an automated assistant from {_COMPANY_NAME}.")
+    
     if _recording_enabled():
         lines.append("With your consent, this call may be recorded for quality and support.")
     lines.append(prompt_line)
@@ -1365,9 +1406,156 @@ def api_transcript(call_sid: str) -> Response:
 
 @app.route("/api/scamcalls/call-now", methods=["POST"])
 def api_call_now() -> Response:
+    # Check rate limits before allowing call
+    if _DEST_NUMBER:
+        allowed, wait_s = _can_attempt(time.time(), _DEST_NUMBER)
+        if not allowed:
+            return jsonify({"error": "cap", "message": "Max calls reached in alloted time. Dont over scam the scammer!"}), 429
+    
     _manual_call_requested.set()
     logging.info("Call-now requested via API.")
     return jsonify({"ok": True}), 200
+
+
+@app.route("/api/admin/login", methods=["POST"])
+def api_admin_login() -> Response:
+    """Admin login endpoint."""
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        username = data.get("username", "").strip()
+        password = data.get("password", "").strip()
+        
+        if username == _ADMIN_USERNAME and password == _ADMIN_PASSWORD:
+            session["is_admin"] = True
+            session.permanent = True  # Keep session across browser restarts
+            return jsonify({"ok": True}), 200
+        else:
+            return jsonify({"ok": False, "error": "Invalid credentials"}), 401
+    except Exception as e:
+        return jsonify({"ok": False, "error": "Login failed"}), 500
+
+
+@app.route("/api/admin/logout", methods=["POST"])
+def api_admin_logout() -> Response:
+    """Admin logout endpoint."""
+    session.pop("is_admin", None)
+    return jsonify({"ok": True}), 200
+
+
+@app.route("/api/admin/config", methods=["GET"])
+def api_admin_config_get() -> Response:
+    """Get editable configuration values."""
+    if not _is_admin():
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    config = {}
+    for key, value in os.environ.items():
+        if not _is_secret_key(key):
+            config[key] = value
+    
+    return jsonify({"config": config}), 200
+
+
+@app.route("/api/admin/config", methods=["PUT"])
+def api_admin_config_put() -> Response:
+    """Update editable configuration values."""
+    if not _is_admin():
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        updates = data.get("updates", {})
+        
+        if not isinstance(updates, dict):
+            return jsonify({"ok": False, "error": "Invalid updates format"}), 400
+        
+        saved_keys = []
+        
+        # Filter out secret keys
+        for key, value in updates.items():
+            if _is_secret_key(key):
+                continue
+            
+            # Update environment variable
+            os.environ[key] = str(value)
+            saved_keys.append(key)
+        
+        # Update .env file
+        if saved_keys:
+            _update_env_file(updates)
+        
+        return jsonify({"ok": True, "saved": saved_keys}), 200
+        
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/scamcalls/next-greeting", methods=["POST"])
+def api_next_greeting() -> Response:
+    """Set a one-time greeting phrase for the next call."""
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        phrase = data.get("phrase", "").strip()
+        
+        if not phrase:
+            return jsonify({"ok": False, "error": "Phrase is required"}), 400
+        
+        # Word count validation (5-15 words)
+        words = phrase.split()
+        if len(words) < 5:
+            return jsonify({"ok": False, "error": "Phrase must be at least 5 words"}), 400
+        if len(words) > 15:
+            return jsonify({"ok": False, "error": "Phrase must be no more than 15 words"}), 400
+        
+        # Store the greeting phrase
+        with _greeting_phrase_lock:
+            global _next_greeting_phrase
+            _next_greeting_phrase = phrase
+        
+        return jsonify({"ok": True}), 200
+        
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+def _update_env_file(updates: Dict[str, str]) -> None:
+    """Update .env file with new values, preserving non-secret entries."""
+    env_path = ".env"
+    
+    # Read existing content
+    existing_lines = []
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            existing_lines = f.readlines()
+    
+    # Parse existing content
+    env_vars = {}
+    comments_and_blanks = []
+    
+    for line in existing_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            comments_and_blanks.append(line)
+        elif "=" in line:
+            key, value = line.split("=", 1)
+            env_vars[key.strip()] = value.rstrip("\n")
+        else:
+            comments_and_blanks.append(line)
+    
+    # Update with new values (only non-secret keys)
+    for key, value in updates.items():
+        if not _is_secret_key(key):
+            env_vars[key] = value
+    
+    # Write back to file
+    with open(env_path, "w", encoding="utf-8") as f:
+        # Write comments and blanks first
+        for line in comments_and_blanks:
+            f.write(line)
+        
+        # Write environment variables
+        for key, value in env_vars.items():
+            f.write(f"{key}={value}\n")
 
 
 # ====== CLI setup and main loop ======
