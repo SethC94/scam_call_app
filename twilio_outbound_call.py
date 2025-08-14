@@ -3,12 +3,12 @@
 Scam Call Console: Outbound caller service with admin UI, pacing, Twilio voice,
 optional Media Streams, live transcript API, and clean shutdown.
 
-Updates:
-- Proper logging configuration (fixes AttributeError from basicConfig return value).
-- Prevent overlapping calls using an "outgoing pending" guard with expiry.
-- Backend is the single source of auto-dial at countdown zero (UI does not auto-dial).
-- Pause countdown and mark call_in_progress while pending or active.
-- Reset schedule on call completion only.
+Updates in this version:
+- Graceful termination: Ctrl+C (SIGINT) and SIGTERM now stop the server and background threads cleanly.
+- Wait-to-speak: Wait for the callee to speak first before the assistant starts talking.
+- Alternating voice per call: Switches assistant TTS voice between male and female every other call.
+- Rotating dialog: Each call uses a different dialog set (will cycle through the list).
+- Dialogs may include harsh language as requested.
 """
 
 from __future__ import annotations
@@ -77,7 +77,7 @@ app = Flask(__name__, static_folder="static", template_folder="templates")
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1)  # type: ignore
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
 
-# Proper logging setup
+# Logging setup
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -134,17 +134,6 @@ def _load_dotenv_pairs(path: str) -> List[Tuple[str, str]]:
     except Exception as e:
         logging.error("Failed to read .env pairs: %s", e)
     return pairs
-
-
-def _load_dotenv_lines(path: str) -> List[str]:
-    p = Path(path)
-    if not p.exists():
-        return []
-    try:
-        with p.open("r", encoding="utf-8") as f:
-            return f.readlines()
-    except Exception:
-        return []
 
 
 def _overlay_env_from_dotenv(path: str) -> None:
@@ -330,46 +319,49 @@ def _load_dotenv_for_write() -> List[str]:
 
 def _write_env_updates_preserving_comments(updates: Dict[str, str]) -> None:
     env_path = Path(".env")
-    lines = _load_dotenv_for_write()
-    key_to_idx: Dict[str, int] = {}
-    for idx, raw in enumerate(lines):
-        s = raw.strip()
-        if not s or s.startswith("#"):
-            continue
-        eq = s.find("=")
-        if eq <= 0:
-            continue
-        k = s[:eq].strip()
-        if k in _EDITABLE_ENV_KEYS:
-            key_to_idx[k] = idx
-    content = list(lines)
-    for k, v in updates.items():
-        if k not in _EDITABLE_ENV_KEYS:
-            continue
-        safe_v = "" if v is None else str(v)
-        new_line = f"{k}={safe_v}\n"
-        if k in key_to_idx:
-            content[key_to_idx[k]] = new_line
-        else:
-            if content and not content[-1].endswith("\n"):
-                content[-1] = content[-1] + "\n"
-            content.append(new_line)
-    tmp = env_path.with_suffix(".tmp")
-    bak = env_path.with_suffix(".bak")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.writelines(content)
-        f.flush()
     try:
-        if env_path.exists():
-            if bak.exists():
-                try:
-                    bak.unlink()
-                except Exception:
-                    pass
-            env_path.replace(bak)
-    except Exception:
-        pass
-    os.replace(tmp, env_path)
+        lines = _load_dotenv_for_write()
+        key_to_idx: Dict[str, int] = {}
+        for idx, raw in enumerate(lines):
+            s = raw.strip()
+            if not s or s.startswith("#"):
+                continue
+            eq = s.find("=")
+            if eq <= 0:
+                continue
+            k = s[:eq].strip()
+            if k in _EDITABLE_ENV_KEYS:
+                key_to_idx[k] = idx
+        content = list(lines)
+        for k, v in updates.items():
+            if k not in _EDITABLE_ENV_KEYS:
+                continue
+            safe_v = "" if v is None else str(v)
+            new_line = f"{k}={safe_v}\n"
+            if k in key_to_idx:
+                content[key_to_idx[k]] = new_line
+            else:
+                if content and not content[-1].endswith("\n"):
+                    content[-1] = content[-1] + "\n"
+                content.append(new_line)
+        tmp = env_path.with_suffix(".tmp")
+        bak = env_path.with_suffix(".bak")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(content)
+            f.flush()
+        try:
+            if env_path.exists():
+                if bak.exists():
+                    try:
+                        bak.unlink()
+                    except Exception:
+                        pass
+                env_path.replace(bak)
+        except Exception:
+            pass
+        os.replace(tmp, env_path)
+    except Exception as e:
+        logging.error("Failed writing .env: %s", e)
 
 
 def _apply_env_updates(updates: Dict[str, str]) -> None:
@@ -520,10 +512,75 @@ def _is_call_busy() -> bool:
     return (_get_current_call_sid() is not None) or _is_outgoing_pending()
 
 
+# Dialog rotation and per-call parameters
+@dataclass
+class CallParams:
+    voice: str
+    dialog_idx: int
+
+
+# Dialog sets. These rotate each call (mild harsh language by request).
+_DIALOGS: List[List[str]] = [
+    ["Where is my refund?", "Stop wasting my time."],
+    ["Do not stall me.", "Answer the question now."],
+    ["Cut the nonsense.", "I am not playing games."],
+    ["You clearly are not prepared.", "Get this together now."],
+    ["I expect clear answers.", "Do not try to dodge this."],
+    ["Enough delays.", "Be direct with me."],
+]
+
+_CALL_PARAMS_BY_SID: Dict[str, CallParams] = {}
+_PENDING_CALL_PARAMS: Optional[CallParams] = None
+_PLACED_CALL_COUNT = 0
+_LAST_DIALOG_IDX = -1
+_PARAMS_LOCK = threading.Lock()
+
+
+def _select_next_call_params() -> CallParams:
+    global _PLACED_CALL_COUNT, _LAST_DIALOG_IDX
+    with _PARAMS_LOCK:
+        _PLACED_CALL_COUNT += 1
+        voice = "man" if (_PLACED_CALL_COUNT % 2 == 1) else "woman"  # alternate voice each call
+        _LAST_DIALOG_IDX = (_LAST_DIALOG_IDX + 1) % max(1, len(_DIALOGS))
+        return CallParams(voice=voice, dialog_idx=_LAST_DIALOG_IDX)
+
+
+def _prepare_params_for_next_call() -> None:
+    global _PENDING_CALL_PARAMS
+    with _PARAMS_LOCK:
+        _PENDING_CALL_PARAMS = _select_next_call_params()
+
+
+def _assign_params_to_sid(sid: str) -> None:
+    global _PENDING_CALL_PARAMS
+    if not sid:
+        return
+    with _PARAMS_LOCK:
+        if _PENDING_CALL_PARAMS is None:
+            _PENDING_CALL_PARAMS = _select_next_call_params()
+        _CALL_PARAMS_BY_SID[sid] = _PENDING_CALL_PARAMS
+        _PENDING_CALL_PARAMS = None
+
+
+def _get_params_for_sid(sid: str) -> CallParams:
+    with _PARAMS_LOCK:
+        cp = _CALL_PARAMS_BY_SID.get(sid)
+        if cp:
+            return cp
+        return CallParams(voice=_runtime.tts_voice or "man", dialog_idx=0)
+
+
+def _get_dialog_lines(idx: int) -> List[str]:
+    if not _DIALOGS:
+        return ["Hello.", "Goodbye."]
+    return _DIALOGS[idx % len(_DIALOGS)]
+
+
 def _place_call_now() -> bool:
     """
     Attempt to place a call once, returning True if Twilio accepted the request.
     Sets 'outgoing pending' immediately to prevent duplicates before callbacks.
+    Also preselects voice/dialog for the call.
     """
     client = _ensure_twilio_client()
     from_n = _choose_from_number()
@@ -531,6 +588,7 @@ def _place_call_now() -> bool:
     if not client or not from_n or not public_url:
         return False
     try:
+        _prepare_params_for_next_call()
         call = client.calls.create(
             to=_runtime.to_number,
             from_=from_n,
@@ -820,23 +878,35 @@ def api_next_greeting():
     return jsonify(ok=True)
 
 
-def _build_opening_lines() -> List[str]:
+def _build_opening_lines_for_sid(call_sid: str) -> List[str]:
+    """
+    Build opening lines for this call. If a one-shot greeting is present, use that.
+    Otherwise, use the first line from the selected dialog for this call.
+    Optionally append company/topic context.
+    """
     one = _pop_one_shot_opening()
     if one:
-        return [one]
-    lines: List[str] = []
+        lines = [one]
+    else:
+        params = _get_params_for_sid(call_sid)
+        base_dialog = _get_dialog_lines(params.dialog_idx)
+        first = base_dialog[0] if base_dialog else "Hello."
+        lines = [first]
+    # Optional context additions
     if _runtime.company_name:
-        lines.append(f"Hello, this is {_runtime.company_name}.")
+        lines.append(f"This is {_runtime.company_name}.")
     if _runtime.topic:
         lines.append(f"I am calling about {_runtime.topic}.")
-    if not lines:
-        lines.append("Hello.")
-    return lines
+    return [ln for ln in lines if ln]
 
 
 # Twilio voice routes
 @app.route("/voice", methods=["POST", "GET"])
 def voice_entrypoint():
+    """
+    Entry point for the call.
+    Behavior: Wait for the callee to speak first, then the assistant responds.
+    """
     if VoiceResponse is None:
         return Response("Server missing Twilio TwiML library.", status=500)
     vr = VoiceResponse()
@@ -845,6 +915,7 @@ def voice_entrypoint():
     if call_sid:
         _set_current_call_sid(call_sid)
         _clear_outgoing_pending()
+        _assign_params_to_sid(call_sid)
 
     # Optional Media Streams
     if _runtime.enable_media_streams and Start is not None and Stream is not None and _runtime.public_base_url:
@@ -857,7 +928,57 @@ def voice_entrypoint():
         except Exception as e:
             logging.warning("Failed to attach media streams: %s", e)
 
-    # Opening lines with barge-in Gather
+    # Wait for callee to speak first
+    g = Gather(
+        input="speech",
+        method="POST",
+        action=url_for("hello_got_speech", _external=True),
+        timeout=str(_runtime.callee_silence_hangup_seconds),
+        speech_timeout="auto",
+        barge_in=False,
+        partial_result_callback=url_for("transcribe_partial", stage="hello", seq=0, _external=True),
+        partial_result_callback_method="POST",
+        language=_runtime.tts_language,
+    )
+    # No initial speech from assistant; we are waiting for the callee
+    vr.append(g)
+
+    # In case the gather times out and Twilio falls through, provide a fallback redirect to action
+    vr.redirect(url_for("hello_got_speech", _external=True), method="POST")
+    return Response(str(vr), status=200, mimetype="text/xml")
+
+
+@app.route("/hello", methods=["POST"])
+def hello_got_speech():
+    """
+    Called after the initial Gather when the callee speaks (or on timeout via redirect).
+    Respond with opening lines, then listen again.
+    """
+    if VoiceResponse is None:
+        return Response("Server missing Twilio TwiML library.", status=500)
+    vr = VoiceResponse()
+
+    call_sid = request.values.get("CallSid", "") or ""
+    if call_sid:
+        _set_current_call_sid(call_sid)
+        _clear_outgoing_pending()
+        _assign_params_to_sid(call_sid)
+
+    # Record what callee said (if any)
+    speech_text = (request.values.get("SpeechResult") or "").strip()
+    if speech_text:
+        _append_transcript(call_sid, "Callee", speech_text, is_final=True)
+
+    # Assistant speaks opening lines now
+    params = _get_params_for_sid(call_sid)
+    opening_lines = _build_opening_lines_for_sid(call_sid)
+    for i, line in enumerate(opening_lines):
+        _append_transcript(call_sid, "Assistant", line, is_final=True)
+        vr.say(line, voice=params.voice, language=_runtime.tts_language)
+        if i < len(opening_lines) - 1:
+            vr.pause(length=1)
+
+    # Now listen again for callee's response and continue in /transcribe
     g = Gather(
         input="speech",
         method="POST",
@@ -869,15 +990,10 @@ def voice_entrypoint():
         partial_result_callback_method="POST",
         language=_runtime.tts_language,
     )
-    opening_lines = _build_opening_lines()
-    for i, line in enumerate(opening_lines):
-        if not line:
-            continue
-        _append_transcript(call_sid or "", "Assistant", line, is_final=True)
-        g.say(line, voice=_runtime.tts_voice, language=_runtime.tts_language)
-        if i < len(opening_lines) - 1:
-            g.pause(length=1)
     vr.append(g)
+    # If no response, politely end the call
+    vr.say("Goodbye.", voice=params.voice, language=_runtime.tts_language)
+    vr.hangup()
     return Response(str(vr), status=200, mimetype="text/xml")
 
 
@@ -890,10 +1006,15 @@ def transcribe():
     speech_text = (request.values.get("SpeechResult") or "").strip()
     if speech_text:
         _append_transcript(call_sid, "Callee", speech_text, is_final=True)
-    vr = VoiceResponse()
-    reply = "Thank you for your time. Goodbye."
+
+    # Assistant responds with the next line from the dialog, then hang up
+    params = _get_params_for_sid(call_sid)
+    dialog_lines = _get_dialog_lines(params.dialog_idx)
+    reply = dialog_lines[1] if len(dialog_lines) > 1 else "Goodbye."
     _append_transcript(call_sid, "Assistant", reply, is_final=True)
-    vr.say(reply, voice=_runtime.tts_voice, language=_runtime.tts_language)
+
+    vr = VoiceResponse()
+    vr.say(reply, voice=params.voice, language=_runtime.tts_language)
     vr.hangup()
     return Response(str(vr), status=200, mimetype="text/xml")
 
@@ -1049,11 +1170,20 @@ def _shutdown_ngrok():
 
 
 def _handle_termination(signum, frame):
+    """
+    Handle SIGINT/SIGTERM: stop background tasks and exit the process.
+    """
     logging.info("Termination signal received (%s). Stopping service.", signum)
     try:
         _stop_requested.set()
     except Exception:
         pass
+    # Give background threads a brief moment to exit, then terminate process
+    try:
+        time.sleep(0.5)
+    except Exception:
+        pass
+    raise SystemExit(0)
 
 
 signal.signal(signal.SIGTERM, _handle_termination)
@@ -1091,6 +1221,7 @@ def main():
     host = _runtime.flask_host or os.environ.get("FLASK_HOST", "0.0.0.0")
     port = int(_runtime.flask_port or _parse_int(os.environ.get("FLASK_PORT"), 8080))
     debug = bool(_runtime.flask_debug or _parse_bool(os.environ.get("FLASK_DEBUG"), False))
+    # use_reloader=False prevents duplicate processes that ignore signals
     app.run(host=host, port=port, debug=debug, use_reloader=False)
 
 
