@@ -4,7 +4,7 @@
   const qs = (sel, ctx = document) => ctx.querySelector(sel);
   const qsa = (sel, ctx = document) => Array.from(ctx.querySelectorAll(sel));
 
-  // Inject small CSS for the live panel blackout when active
+  // Style for live panel blackout during active call
   (function ensureStyle() {
     const id = "live-convo-style";
     if (qs(`#${id}`)) return;
@@ -58,7 +58,6 @@
     return `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
   }
 
-  // Countdown ring (SVG)
   function buildCountdownBadge(remainSec, totalSec, paused) {
     const size = 168;
     const stroke = 10;
@@ -279,9 +278,7 @@
   let statusTimer = null;
   let liveTimer = null;
   let callActive = false;
-  let autoCallInFlight = false;
 
-  // Status render
   function renderNumbersLine(data) {
     const to = data.to_number || "";
     const fromSingle = data.from_number || "";
@@ -305,30 +302,10 @@
     </div>`;
   }
 
-  function renderStatus(data) {
-    const area = qs("#statusArea");
-    if (!area) return;
-
+  function buildStatusCard(data) {
     const paused = !!data.call_in_progress;
-    const parts = [];
-
-    if (data.within_active_window) {
-      parts.push(`<div class="chip" style="display:inline-flex;align-items:center;gap:.5rem;padding:.35rem .6rem;border:1px solid var(--border);border-radius:999px;background:rgba(0,0,0,.2);">
-        <span style="width:.55rem;height:.55rem;border-radius:50%;background:var(--accent,#25c2a0);display:inline-block"></span>
-        <span>${paused ? "Active call in progress" : "Active window"}</span>
-      </div>`);
-    } else {
-      parts.push(`<div class="chip" style="display:inline-flex;align-items:center;gap:.5rem;padding:.35rem .6rem;border:1px solid var(--border);border-radius:999px;background:rgba(0,0,0,.2);">
-        <span style="width:.55rem;height:.55rem;border-radius:50%;background:#e55353;display:inline-block"></span>
-        <span>Inactive now (hours ${escapeHtml(data.active_hours_local || "")})</span>
-      </div>`);
-    }
-
-    parts.push(`<span class="muted" style="margin-left:.6rem">Attempts (1h/day): ${data.attempts_last_hour}/${data.hourly_max_attempts} · ${data.attempts_last_day}/${data.daily_max_attempts}</span>`);
-
-    // When paused, keep the ring static and label accordingly
     let remain = data.seconds_until_next;
-    let total = data.interval_total_seconds || remain || 0;
+    const total = data.interval_total_seconds || remain || 0;
 
     const svg = buildCountdownBadge(remain ?? 0, total, paused);
     const bigLabel = paused ? "Call in progress" : "Next attempt";
@@ -341,35 +318,34 @@
         ${renderNumbersLine(data)}
       </div>`;
 
-    const focal =
-      `<div style="display:flex;align-items:center;gap:1rem;margin-top:.9rem">
+    return `
+      <div style="display:flex;align-items:center;gap:1rem;margin-top:.9rem">
         <div style="flex:0 0 auto">${svg}</div>
         <div style="flex:1 1 auto">${labelBlock}</div>
       </div>`;
-
-    area.innerHTML = `${parts.join(" ")} ${focal}`;
   }
 
-  // Auto-call logic on countdown
-  async function maybeAutoCall(data) {
-    if (autoCallInFlight || callActive) return;
-    if (!data.within_active_window) return;
-    if (!data.can_attempt_now) return;
-    if (typeof data.seconds_until_next !== "number") return;
-    if (data.seconds_until_next > 0) return;
+  function renderStatus(data) {
+    const area = qs("#statusArea");
+    if (!area) return;
 
-    autoCallInFlight = true;
-    try {
-      const res = await fetch("/api/call-now", { method: "POST" });
-      if (!res.ok && res.status !== 409) {
-        // 409 means already in progress; anything else we show a brief toast
-        showToast("Auto-call attempt failed.");
-      }
-    } catch {
-      // Ignore transient failure
-    } finally {
-      autoCallInFlight = false;
+    const parts = [];
+
+    if (data.within_active_window) {
+      parts.push(`<div class="chip" style="display:inline-flex;align-items:center;gap:.5rem;padding:.35rem .6rem;border:1px solid var(--border);border-radius:999px;background:rgba(0,0,0,.2);">
+        <span style="width:.55rem;height:.55rem;border-radius:50%;background:var(--accent,#25c2a0);display:inline-block"></span>
+        <span>${data.call_in_progress ? "Active call in progress" : "Active window"}</span>
+      </div>`);
+    } else {
+      parts.push(`<div class="chip" style="display:inline-flex;align-items:center;gap:.5rem;padding:.35rem .6rem;border:1px solid var(--border);border-radius:999px;background:rgba(0,0,0,.2);">
+        <span style="width:.55rem;height:.55rem;border-radius:50%;background:#e55353;display:inline-block"></span>
+        <span>Inactive now (hours ${escapeHtml(data.active_hours_local || "")})</span>
+      </div>`);
     }
+
+    parts.push(`<span class="muted" style="margin-left:.6rem">Attempts (1h/day): ${data.attempts_last_hour}/${data.hourly_max_attempts} · ${data.attempts_last_day}/${data.daily_max_attempts}</span>`);
+
+    area.innerHTML = `${parts.join(" ")} ${buildStatusCard(data)}`;
   }
 
   async function pollStatusOnce() {
@@ -377,13 +353,8 @@
       const res = await fetch("/api/status", { method: "GET", cache: "no-cache" });
       if (!res.ok) throw new Error(await res.text() || "Failed to load status.");
       const data = await res.json();
-      // While the live poll sets callActive more precisely, the status endpoint also carries call_in_progress.
-      // Prefer the live state when available; otherwise fall back to status flag.
-      if (typeof data.call_in_progress === "boolean" && callActive !== true) {
-        callActive = data.call_in_progress;
-      }
+      callActive = !!data.call_in_progress;
       renderStatus(data);
-      await maybeAutoCall(data);
     } catch {
       const area = qs("#statusArea");
       if (area) area.innerHTML = `<div class="muted">Status unavailable.</div>`;
@@ -400,6 +371,7 @@
   }
 
   // Live conversation UI
+  let liveTimer = null;
   let ws = null;
   let audioCtx = null;
   let scriptNode = null;
@@ -439,7 +411,7 @@
     container.scrollTop = container.scrollHeight;
   }
 
-  // Merge logic: render all final entries, and keep only one updating partial callee line
+  // Merge logic: render finals and keep only one updating partial callee line
   function renderLiveTranscriptList(container, list) {
     const finals = list.filter((e) => e && e.final);
     const latestPartial = [...list].reverse().find((e) => e && !e.final);
@@ -450,7 +422,6 @@
       finals.forEach((e) => appendTranscriptEntry(container, e));
       container.setAttribute("data-final-count", String(finals.length));
     }
-    // Update or add single partial line
     let partialEl = qs(".conv-line[data-final='0']", container);
     if (latestPartial && latestPartial.text) {
       if (!partialEl) {
@@ -463,7 +434,6 @@
       qs(".conv-text", partialEl).textContent = latestPartial.text;
       container.scrollTop = container.scrollHeight;
     } else {
-      // No current partial -> remove if present
       if (partialEl) partialEl.remove();
     }
   }
@@ -479,18 +449,19 @@
       const panel = qs("#livePanel");
       if (!container || !btn || !status || !panel) return;
 
-      callActive = !!data.in_progress;
-      panel.classList.toggle("active", callActive);
+      const inProgress = !!data.in_progress;
+      callActive = inProgress;
+      panel.classList.toggle("active", inProgress);
 
-      // Enable or disable Listen button based on feature flag and call state
-      btn.disabled = !callActive || !data.media_streams_enabled;
+      // Enable/disable Listen button based on feature flag and call state
+      btn.disabled = !inProgress || !data.media_streams_enabled;
 
       // Render merged transcript
       const list = Array.isArray(data.transcript) ? data.transcript : [];
       renderLiveTranscriptList(container, list);
 
       // Stop listening automatically when call ends
-      if (!callActive && ws) {
+      if (!inProgress && ws) {
         stopListening();
       }
     } catch {
@@ -510,7 +481,7 @@
     pollLiveTranscript();
   }
 
-  // Audio handling with μ-law 8kHz -> AudioContext sample-rate conversion
+  // Audio handling with μ-law 8 kHz -> AudioContext sample-rate conversion
   function mulawDecodeSample(mu) {
     mu = ~mu & 0xff;
     const sign = (mu & 0x80) ? -1 : 1;
@@ -564,7 +535,6 @@
     const status = qs("#listenStatus");
     const btn = qs("#btnListenLive");
 
-    // Only allow when enabled
     if (btn && btn.disabled) return;
 
     try {
@@ -572,7 +542,6 @@
       ws = new WebSocket(`${scheme}://${location.host}/client-audio`);
       ws.onopen = async () => {
         if (!audioCtx) {
-          // Use system default rate (often 44100 or 48000) and resample
           audioCtx = new (window.AudioContext || window.webkitAudioContext)();
           try { await audioCtx.resume(); } catch {}
           scriptNode = audioCtx.createScriptProcessor(4096, 0, 1);
