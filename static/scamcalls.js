@@ -173,11 +173,23 @@
       callNowBtn.addEventListener("click", async () => {
         try {
           callNowBtn.disabled = true;
-          await apiPost("/api/scamcalls/call-now");
+          const response = await fetch("/api/scamcalls/call-now", { method: "POST" });
+          const data = await response.json();
+          
+          if (!response.ok) {
+            if (data.code === "cap") {
+              showToast("Max calls reached in allotted time. Don't over scam the scammer!", "error");
+            } else {
+              throw new Error(data.message || "Failed to request call");
+            }
+          } else {
+            showToast("Call requested successfully!", "success");
+          }
+          
           setTimeout(() => { callNowBtn.disabled = false; }, 3000);
-        } catch {
+        } catch (err) {
           callNowBtn.disabled = false;
-          alert("Failed to request a call. Please try again.");
+          showToast("Failed to request a call. Please try again.", "error");
         }
       });
     }
@@ -195,6 +207,22 @@
         } catch {
           alert("Unable to start audio context. Please try again.");
         }
+      });
+    }
+
+    // Greeting phrase button
+    const greetingBtn = document.getElementById("greetingBtn");
+    if (greetingBtn) {
+      greetingBtn.addEventListener("click", () => {
+        showGreetingModal();
+      });
+    }
+
+    // Admin button
+    const adminBtn = document.getElementById("adminBtn");
+    if (adminBtn) {
+      adminBtn.addEventListener("click", () => {
+        showAdminLoginModal();
       });
     }
 
@@ -472,6 +500,299 @@
     }
 
     loadHistory();
+  }
+
+  // Utility functions for modals and notifications
+  function showToast(message, type = "info") {
+    const toast = document.createElement("div");
+    toast.className = `matrix-toast ${type}`;
+    toast.textContent = message;
+    document.body.appendChild(toast);
+
+    setTimeout(() => {
+      if (toast.parentNode) {
+        toast.parentNode.removeChild(toast);
+      }
+    }, 4000);
+  }
+
+  function createModal(content) {
+    const modal = document.createElement("div");
+    modal.className = "matrix-modal";
+    modal.innerHTML = `<div class="matrix-modal-content">${content}</div>`;
+    
+    // Close modal when clicking outside
+    modal.addEventListener("click", (e) => {
+      if (e.target === modal) {
+        closeModal(modal);
+      }
+    });
+
+    document.body.appendChild(modal);
+    return modal;
+  }
+
+  function closeModal(modal) {
+    if (modal && modal.parentNode) {
+      modal.parentNode.removeChild(modal);
+    }
+  }
+
+  function showGreetingModal() {
+    const content = `
+      <h3>Add Greeting Phrase</h3>
+      <p>Enter a short phrase (5-15 words) for the next call:</p>
+      <input type="text" id="greetingInput" placeholder="Enter greeting phrase..." maxlength="200">
+      <div id="greetingWordCount" style="font-size: 12px; opacity: 0.7; margin-top: 4px;">0 words</div>
+      <div class="button-group">
+        <button type="button" onclick="closeGreetingModal()">Cancel</button>
+        <button type="button" class="primary" onclick="submitGreeting()">Add Phrase</button>
+      </div>
+    `;
+
+    const modal = createModal(content);
+    modal.id = "greetingModal";
+
+    const input = modal.querySelector("#greetingInput");
+    const wordCount = modal.querySelector("#greetingWordCount");
+
+    input.addEventListener("input", () => {
+      const words = input.value.trim().split(/\s+/).filter(w => w.length > 0);
+      const count = words.length;
+      wordCount.textContent = `${count} words`;
+      
+      if (count < 5 || count > 15) {
+        wordCount.style.color = "#ff6b6b";
+      } else {
+        wordCount.style.color = "#0f0";
+      }
+    });
+
+    input.focus();
+
+    // Global functions for the modal
+    window.closeGreetingModal = () => closeModal(modal);
+    window.submitGreeting = async () => {
+      const phrase = input.value.trim();
+      const words = phrase.split(/\s+/).filter(w => w.length > 0);
+      
+      if (words.length < 5 || words.length > 15) {
+        showToast("Phrase must be 5-15 words", "error");
+        return;
+      }
+
+      try {
+        const response = await fetch("/api/scamcalls/set-greeting", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ phrase })
+        });
+
+        const data = await response.json();
+        
+        if (response.ok) {
+          showToast("Greeting phrase set for next call!", "success");
+          closeModal(modal);
+        } else {
+          showToast(data.error || "Failed to set greeting phrase", "error");
+        }
+      } catch (err) {
+        showToast("Failed to set greeting phrase", "error");
+      }
+    };
+  }
+
+  let adminAuthenticated = false;
+
+  function showAdminLoginModal() {
+    if (adminAuthenticated) {
+      showAdminPanel();
+      return;
+    }
+
+    const content = `
+      <h3>Admin Login</h3>
+      <input type="text" id="adminUsername" placeholder="Username" autocomplete="username">
+      <input type="password" id="adminPassword" placeholder="Password" autocomplete="current-password">
+      <div class="button-group">
+        <button type="button" onclick="closeAdminModal()">Cancel</button>
+        <button type="button" class="primary" onclick="submitAdminLogin()">Login</button>
+      </div>
+    `;
+
+    const modal = createModal(content);
+    modal.id = "adminModal";
+
+    const usernameInput = modal.querySelector("#adminUsername");
+    const passwordInput = modal.querySelector("#adminPassword");
+
+    // Handle Enter key
+    passwordInput.addEventListener("keypress", (e) => {
+      if (e.key === "Enter") {
+        window.submitAdminLogin();
+      }
+    });
+
+    usernameInput.focus();
+
+    window.closeAdminModal = () => closeModal(modal);
+    window.submitAdminLogin = async () => {
+      const username = usernameInput.value.trim();
+      const password = passwordInput.value;
+
+      if (!username || !password) {
+        showToast("Please enter both username and password", "error");
+        return;
+      }
+
+      try {
+        const response = await fetch("/api/admin/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, password })
+        });
+
+        const data = await response.json();
+
+        if (response.ok) {
+          adminAuthenticated = true;
+          showToast("Admin login successful", "success");
+          closeModal(modal);
+          showAdminPanel();
+        } else {
+          showToast(data.error || "Invalid credentials", "error");
+        }
+      } catch (err) {
+        showToast("Login failed", "error");
+      }
+    };
+  }
+
+  function showAdminPanel() {
+    // Create admin panel in the main content area
+    let adminPanel = document.getElementById("adminPanel");
+    if (adminPanel) {
+      adminPanel.scrollIntoView({ behavior: "smooth" });
+      return;
+    }
+
+    const main = document.querySelector("main");
+    adminPanel = document.createElement("div");
+    adminPanel.id = "adminPanel";
+    adminPanel.className = "admin-panel";
+    adminPanel.innerHTML = `
+      <h3>Admin Settings</h3>
+      <div id="adminContent">Loading...</div>
+      <div class="button-group" style="margin-top: 16px;">
+        <button type="button" onclick="refreshAdminConfig()">Refresh</button>
+        <button type="button" onclick="saveAdminConfig()">Save Config</button>
+        <button type="button" onclick="restartApp()">Restart App</button>
+        <button type="button" onclick="adminLogout()">Logout</button>
+      </div>
+    `;
+
+    main.appendChild(adminPanel);
+    loadAdminConfig();
+
+    window.refreshAdminConfig = loadAdminConfig;
+    window.saveAdminConfig = saveAdminConfig;
+    window.restartApp = restartApp;
+    window.adminLogout = adminLogout;
+
+    adminPanel.scrollIntoView({ behavior: "smooth" });
+  }
+
+  async function loadAdminConfig() {
+    const content = document.getElementById("adminContent");
+    if (!content) return;
+
+    try {
+      const response = await fetch("/api/admin/config");
+      if (!response.ok) {
+        throw new Error("Failed to load config");
+      }
+
+      const config = await response.json();
+      let html = '<div class="env-vars">';
+
+      for (const [key, value] of Object.entries(config).sort()) {
+        html += `
+          <div class="env-var">
+            <label>${key}:</label>
+            <input type="text" name="${key}" value="${escapeHtml(value)}" />
+          </div>
+        `;
+      }
+
+      html += '</div>';
+      content.innerHTML = html;
+    } catch (err) {
+      content.innerHTML = `<div style="color: #ff6b6b;">Error loading config: ${err.message}</div>`;
+    }
+  }
+
+  async function saveAdminConfig() {
+    const envVars = document.querySelectorAll("#adminContent .env-var input");
+    const updates = {};
+
+    envVars.forEach(input => {
+      updates[input.name] = input.value;
+    });
+
+    try {
+      const response = await fetch("/api/admin/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ updates })
+      });
+
+      const data = await response.json();
+
+      if (response.ok) {
+        showToast("Configuration saved successfully", "success");
+      } else {
+        showToast(data.error || "Failed to save configuration", "error");
+      }
+    } catch (err) {
+      showToast("Failed to save configuration", "error");
+    }
+  }
+
+  async function restartApp() {
+    try {
+      const response = await fetch("/api/scamcalls/reload-now", { method: "POST" });
+      const data = await response.json();
+
+      if (response.ok) {
+        showToast("Restart requested. Please wait...", "success");
+      } else {
+        showToast(data.error || "Failed to restart app", "error");
+      }
+    } catch (err) {
+      showToast("Failed to restart app", "error");
+    }
+  }
+
+  async function adminLogout() {
+    try {
+      await fetch("/api/admin/logout", { method: "POST" });
+      adminAuthenticated = false;
+      
+      const adminPanel = document.getElementById("adminPanel");
+      if (adminPanel) {
+        adminPanel.remove();
+      }
+      
+      showToast("Logged out successfully", "success");
+    } catch (err) {
+      showToast("Logout failed", "error");
+    }
+  }
+
+  function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
   }
 
   const pageLive = isLivePage;

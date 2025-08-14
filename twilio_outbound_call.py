@@ -28,8 +28,11 @@ import random
 import signal
 import logging
 import threading
+import hashlib
+import secrets
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, Set, Dict, Any, List
+from collections import defaultdict
 
 # Optional .env auto-load
 try:
@@ -41,7 +44,7 @@ except Exception:
 # Ensure pyngrok uses local binary if set (optional)
 os.environ.setdefault("NGROK_PATH", "/opt/homebrew/bin/ngrok")
 
-from flask import Flask, request, Response, render_template, jsonify, send_from_directory
+from flask import Flask, request, Response, render_template, jsonify, send_from_directory, session
 
 # WebSockets
 try:
@@ -80,7 +83,32 @@ except Exception:
 
 # Flask app and WebSocket sock
 app = Flask(__name__)
+
+# Admin session configuration
+_ADMIN_SESSION_SECRET = os.getenv("ADMIN_SESSION_SECRET")
+if not _ADMIN_SESSION_SECRET:
+    _ADMIN_SESSION_SECRET = secrets.token_hex(32)
+    print(f"Generated ephemeral admin session secret: {_ADMIN_SESSION_SECRET[:8]}...")
+
+app.secret_key = _ADMIN_SESSION_SECRET
+app.config.update(
+    SESSION_COOKIE_SECURE=os.getenv("FLASK_ENV", "").lower() == "production",
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=24)
+)
+
 sock = Sock(app)
+
+# Admin credentials and rate limiting
+_ADMIN_USERNAME = "bootycall"
+_ADMIN_PASSWORD = "scammers"
+_FAILED_LOGIN_ATTEMPTS = defaultdict(list)  # IP -> list of timestamps
+_MAX_LOGIN_ATTEMPTS = 5
+_LOCKOUT_DURATION = timedelta(minutes=5)
+
+# Greeting phrase storage
+_NEXT_GREETING_PHRASE = None
 
 # Globals
 _STOP_REQUESTED = False
@@ -169,6 +197,11 @@ _TWILIO_CLIENT: Optional[Client] = None
 _call_state_lock = threading.Lock()
 # CallSid -> {...}
 _call_state: Dict[str, Dict[str, Any]] = {}
+
+# Call history and backoff tracking  
+_call_history_lock = threading.Lock()
+_call_history: Dict[str, List[Dict[str, Any]]] = {}  # phone_number -> [{'timestamp': ts, 'outcome': str}, ...]
+_backoff_until: Dict[str, float] = {}  # phone_number -> epoch_timestamp
 
 # Diagnostics
 _diag_lock = threading.Lock()
@@ -781,11 +814,109 @@ def _next_prompt() -> str:
 
 
 def _assign_prompt_if_needed(call_sid: str) -> str:
+    global _NEXT_GREETING_PHRASE
     d = _ensure_diag_state(call_sid)
     with _diag_lock:
         if not d.get("prompt"):
-            d["prompt"] = _next_prompt()
+            # Check if there's a manual greeting phrase set
+            if _NEXT_GREETING_PHRASE:
+                d["prompt"] = _NEXT_GREETING_PHRASE
+                # Consume the phrase so it's only used once
+                _NEXT_GREETING_PHRASE = None
+                logging.info("Using manual greeting phrase for CallSid=%s", call_sid)
+            else:
+                d["prompt"] = _next_prompt()
         return d["prompt"]
+
+
+# ====== Admin utility functions ======
+
+def _is_rate_limited(ip_address: str) -> bool:
+    """Check if an IP address is rate limited for login attempts."""
+    now = datetime.now()
+    attempts = _FAILED_LOGIN_ATTEMPTS[ip_address]
+    
+    # Clean old attempts
+    cutoff = now - _LOCKOUT_DURATION
+    attempts[:] = [timestamp for timestamp in attempts if timestamp > cutoff]
+    
+    return len(attempts) >= _MAX_LOGIN_ATTEMPTS
+
+
+def _record_failed_login(ip_address: str) -> None:
+    """Record a failed login attempt for an IP address."""
+    _FAILED_LOGIN_ATTEMPTS[ip_address].append(datetime.now())
+
+
+def _is_admin_authenticated() -> bool:
+    """Check if the current session is authenticated as admin."""
+    return session.get("admin_authenticated") is True
+
+
+def _get_allowed_env_vars() -> Dict[str, str]:
+    """Get all environment variables that are safe to edit (excluding secrets)."""
+    secret_patterns = [
+        "token", "secret", "password", "pass", "auth", "key", "sid", 
+        "authtoken", "account_sid", "auth_token"
+    ]
+    
+    allowed_vars = {}
+    for key, value in os.environ.items():
+        # Skip if key matches any secret pattern (case insensitive)
+        if any(pattern in key.lower() for pattern in secret_patterns):
+            continue
+        allowed_vars[key] = value
+    
+    return allowed_vars
+
+
+def _update_env_file(updates: Dict[str, str]) -> None:
+    """Update the .env file with new values for allowed keys."""
+    import tempfile
+    import shutil
+    
+    env_file_path = ".env"
+    allowed_keys = set(_get_allowed_env_vars().keys())
+    
+    # Read existing .env file
+    existing_lines = []
+    if os.path.exists(env_file_path):
+        with open(env_file_path, 'r', encoding='utf-8') as f:
+            existing_lines = f.readlines()
+    
+    # Parse existing environment variables
+    env_dict = {}
+    comments_and_empty = []
+    
+    for line in existing_lines:
+        line = line.rstrip('\n\r')
+        if '=' in line and not line.strip().startswith('#'):
+            key, value = line.split('=', 1)
+            key = key.strip()
+            if key in allowed_keys:
+                env_dict[key] = value
+        else:
+            comments_and_empty.append(line)
+    
+    # Update with new values (only allowed keys)
+    for key, value in updates.items():
+        if key in allowed_keys:
+            env_dict[key] = value
+    
+    # Write to temporary file first
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, encoding='utf-8') as temp_file:
+        # Write comments and empty lines first
+        for line in comments_and_empty:
+            temp_file.write(line + '\n')
+        
+        # Write environment variables
+        for key, value in sorted(env_dict.items()):
+            temp_file.write(f"{key}={value}\n")
+        
+        temp_file_path = temp_file.name
+    
+    # Atomically replace the original file
+    shutil.move(temp_file_path, env_file_path)
 
 
 # ====== TwiML endpoints ======
@@ -1310,6 +1441,7 @@ def api_status() -> Response:
         "activeWindow": _format_active_window_label(),
         "caps": {"hourly": _HOURLY_MAX_PER_DEST, "daily": _DAILY_MAX_PER_DEST},
         "publicUrl": _PUBLIC_BASE_URL or "",
+        "nextGreeting": _NEXT_GREETING_PHRASE,
     }
     return jsonify(data)
 
@@ -1365,9 +1497,162 @@ def api_transcript(call_sid: str) -> Response:
 
 @app.route("/api/scamcalls/call-now", methods=["POST"])
 def api_call_now() -> Response:
+    # Check if call can be attempted now (cap checking)
+    to_number = os.getenv("TO_NUMBER", "")
+    
+    if to_number:
+        # Check caps and backoffs
+        now = time.time()
+        with _call_history_lock:
+            today = datetime.now().date()
+            this_hour = datetime.now().hour
+            
+            # Count calls today and this hour for the destination
+            daily_count = 0
+            hourly_count = 0
+            
+            for entry in _call_history.get(to_number, []):
+                entry_date = datetime.fromtimestamp(entry["timestamp"]).date()
+                entry_hour = datetime.fromtimestamp(entry["timestamp"]).hour
+                
+                if entry_date == today:
+                    daily_count += 1
+                    if entry_hour == this_hour:
+                        hourly_count += 1
+            
+            # Check daily cap
+            if daily_count >= _DAILY_MAX_PER_DEST:
+                return jsonify({
+                    "ok": False, 
+                    "code": "cap",
+                    "message": "Max calls reached in allotted time."
+                }), 429
+            
+            # Check hourly cap
+            if hourly_count >= _HOURLY_MAX_PER_DEST:
+                return jsonify({
+                    "ok": False,
+                    "code": "cap", 
+                    "message": "Max calls reached in allotted time."
+                }), 429
+            
+            # Check backoff
+            if to_number in _backoff_until:
+                if now < _backoff_until[to_number]:
+                    return jsonify({
+                        "ok": False,
+                        "code": "cap",
+                        "message": "Max calls reached in allotted time."
+                    }), 429
+    
     _manual_call_requested.set()
     logging.info("Call-now requested via API.")
     return jsonify({"ok": True}), 200
+
+
+@app.route("/api/scamcalls/set-greeting", methods=["POST"])
+def api_set_greeting() -> Response:
+    """Set a greeting phrase for the next call."""
+    data = request.get_json(force=True) if request.is_json else {}
+    phrase = data.get("phrase", "").strip()
+    
+    if not phrase:
+        return jsonify({"ok": False, "error": "Phrase is required"}), 400
+    
+    # Client-side should validate word count, but let's also validate server-side
+    word_count = len(phrase.split())
+    if word_count < 5 or word_count > 15:
+        return jsonify({"ok": False, "error": "Phrase must be 5-15 words"}), 400
+    
+    global _NEXT_GREETING_PHRASE
+    _NEXT_GREETING_PHRASE = phrase
+    logging.info("Greeting phrase set for next call: %s", phrase)
+    
+    return jsonify({"ok": True})
+
+
+@app.route("/api/scamcalls/reload-now", methods=["POST"])
+def api_reload_now() -> Response:
+    """Trigger application reload."""
+    if not _is_admin_authenticated():
+        return jsonify({"ok": False, "error": "Admin authentication required"}), 401
+    
+    # Set a flag or trigger reload mechanism
+    # For now, we'll just return success - actual reload would need process management
+    logging.info("Application reload requested by admin.")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/scamcalls/reload-status", methods=["GET"])
+def api_reload_status() -> Response:
+    """Get reload status."""
+    # For now, always return not pending - this would be enhanced with actual reload mechanism
+    return jsonify({"pending": False})
+
+
+# ====== Admin API endpoints ======
+
+@app.route("/api/admin/login", methods=["POST"])
+def api_admin_login() -> Response:
+    """Admin login endpoint."""
+    client_ip = request.environ.get('REMOTE_ADDR', request.remote_addr)
+    
+    # Check rate limiting
+    if _is_rate_limited(client_ip):
+        return jsonify({"ok": False, "error": "Too many failed attempts. Try again later."}), 429
+    
+    data = request.get_json(force=True) if request.is_json else {}
+    username = data.get("username", "").strip()
+    password = data.get("password", "").strip()
+    
+    if username != _ADMIN_USERNAME or password != _ADMIN_PASSWORD:
+        _record_failed_login(client_ip)
+        return jsonify({"ok": False, "error": "Invalid credentials"}), 401
+    
+    # Clear failed attempts on successful login
+    if client_ip in _FAILED_LOGIN_ATTEMPTS:
+        del _FAILED_LOGIN_ATTEMPTS[client_ip]
+    
+    session["admin_authenticated"] = True
+    session.permanent = True
+    
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin/logout", methods=["POST"])
+def api_admin_logout() -> Response:
+    """Admin logout endpoint."""
+    session.clear()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin/config", methods=["GET"])
+def api_admin_config_get() -> Response:
+    """Get allowed environment variables."""
+    if not _is_admin_authenticated():
+        return jsonify({"error": "Admin authentication required"}), 401
+    
+    allowed_vars = _get_allowed_env_vars()
+    return jsonify(allowed_vars)
+
+
+@app.route("/api/admin/config", methods=["POST"])
+def api_admin_config_post() -> Response:
+    """Update environment variables."""
+    if not _is_admin_authenticated():
+        return jsonify({"error": "Admin authentication required"}), 401
+    
+    data = request.get_json(force=True) if request.is_json else {}
+    updates = data.get("updates", {})
+    
+    if not isinstance(updates, dict):
+        return jsonify({"ok": False, "error": "Updates must be a dictionary"}), 400
+    
+    try:
+        _update_env_file(updates)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # ====== CLI setup and main loop ======
