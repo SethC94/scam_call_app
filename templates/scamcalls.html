@@ -31,7 +31,6 @@
 
       <div id="statusArea" class="status-area" aria-live="polite"></div>
 
-      <!-- Admin panel is rendered when authenticated -->
       {% if is_admin %}
       <hr />
       <section id="adminPanel" class="admin-panel">
@@ -53,7 +52,6 @@
       {% endif %}
     </section>
 
-    <!-- Modal for one-time greeting phrase -->
     <div id="greetingModal" class="modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="greetingModalTitle">
       <div class="modal__dialog">
         <div class="modal__header">
@@ -72,7 +70,6 @@
       </div>
     </div>
 
-    <!-- Toast container -->
     <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
   </main>
 
