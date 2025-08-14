@@ -711,6 +711,9 @@ def call_now():
     if not check_rate_limit():
         return jsonify({"error": "cap"}), 429
     
+    # Record the call attempt immediately after rate limit check passes
+    record_call_attempt()
+    
     if not twilio_client:
         return jsonify({"ok": False, "error": "Twilio not configured"}), 400
     to_number = env_str("TO_NUMBER") or TO_NUMBER
@@ -752,9 +755,6 @@ def call_now():
                 cs = CallState(call_sid=call.sid)
                 CALLS[call.sid] = cs
             cs.prompt_used = select_prompt()  # approximate the one that will be spoken
-        
-        # Record this call attempt for rate limiting
-        record_call_attempt()
         
         return jsonify({"ok": True, "sid": call.sid})
     except Exception as e:

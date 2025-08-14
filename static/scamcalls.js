@@ -156,17 +156,11 @@
     });
     if (!resp.ok) {
       if (resp.status === 429) {
-        // For rate limit errors, try to get the JSON response
-        try {
-          const data = await resp.json();
-          if (data.error === "cap") {
-            const error = new Error(`HTTP ${resp.status} posting ${path}`);
-            error.rateLimit = true;
-            throw error;
-          }
-        } catch (parseError) {
-          // Fall through to generic error
-        }
+        // For rate limit errors, create a special error
+        const error = new Error(`HTTP ${resp.status} posting ${path}`);
+        error.rateLimit = true;
+        error.status = 429;
+        throw error;
       }
       throw new Error(`HTTP ${resp.status} posting ${path}`);
     }
