@@ -2,34 +2,11 @@
 """
 Scam Call Console: Outbound caller service with admin UI, call pacing, and Twilio integration.
 
-Features in this build
-- /scamcalls UI with:
-  - "Call now" button
-  - "Add greeting phrase" button (client and server enforce 5–15 words)
-  - Admin button (login/logout)
-  - Matrix background (static assets)
-  - Admin panel (when logged in) to edit non-secret .env keys
-- Admin authentication
-  - Defaults to username "bootycall" and password "scammers" if .env ADMIN_* is absent
-  - If .env contains ADMIN_USER and ADMIN_PASSWORD_HASH, bcrypt verification is used
-- .env editing (non-secret keys only)
-  - GET /api/admin/env returns editable keys
-  - POST /api/admin/env persists updates back to the .env file and refreshes runtime settings
-- "Call now"
-  - POST /api/call-now requests an immediate attempt (respects active window and caps)
-  - Returns HTTP 429 with {"ok": false, "reason": "cap_reached"} when max attempts reached in allotted time
-- One-time greeting phrase
-  - POST /api/next-greeting sets a one-shot phrase applied to the next call, then cleared
-- Outbound dialer
-  - Background scheduler attempts calls at randomized intervals between MIN/MAX interval seconds
-  - Uses FROM_NUMBERS (random pick per attempt) when provided; else uses FROM_NUMBER
-  - Enforces HOURLY_MAX_ATTEMPTS_PER_DEST and DAILY_MAX_ATTEMPTS_PER_DEST
-  - Active hours/days enforcement
-
-Notes
-- Keep FLASK_SECRET set in .env for production usage.
-- Twilio credentials (ACCOUNT_SID, AUTH_TOKEN) are expected in real env (process env or hosting configuration),
-  and are intentionally not part of the editable .env keys in the admin UI.
+This build adds:
+- /api/status for frontend countdown and pacing indicators.
+- /api/admin/env (GET/POST) for editing non-secret .env values from the Admin UI.
+- Optional ngrok support: If USE_NGROK=true, a tunnel is started and PUBLIC_BASE_URL is set automatically.
+- Larger countdown UI focus and number visibility improvements (via static assets).
 """
 
 from __future__ import annotations
@@ -40,12 +17,11 @@ import sys
 import json
 import time
 import atexit
-import queue
 import random
 import signal
 import logging
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
 from flask import (
@@ -71,6 +47,12 @@ try:
 except Exception:
     load_dotenv = None
 
+# Optional ngrok integration
+try:
+    from pyngrok import ngrok as ngrok_lib  # type: ignore
+except Exception:
+    ngrok_lib = None
+
 # Twilio SDK
 try:
     from twilio.rest import Client
@@ -86,12 +68,11 @@ except Exception:
 
 DOTENV_PATH = os.environ.get("DOTENV_PATH") or ".env"
 if load_dotenv:
-    # Load early to populate os.environ for configuration parsing.
     load_dotenv(DOTENV_PATH)
 
 # Application
 app = Flask(__name__, static_folder="static", template_folder="templates")
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1)  # honor reverse proxy headers
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1)
 app.secret_key = os.environ.get("FLASK_SECRET", "dev_insecure_change_me")
 
 # Logging
@@ -117,24 +98,21 @@ _dest_attempts: Dict[str, List[float]] = {}  # to_number -> epoch list
 # Next randomized interval bookkeeping (for UI status)
 _next_call_epoch_s_lock = threading.Lock()
 _next_call_epoch_s: Optional[int] = None
-# Track interval timing to enable progress visualization in UI
 _interval_start_epoch_s: Optional[int] = None
 _interval_total_seconds: Optional[int] = None
 
 # Twilio client
 _twilio_client: Optional[Client] = None
 
+# Ngrok tunnel state
+_active_tunnel_url: Optional[str] = None
+
 
 # -----------------------------------------------------------------------------
 # Configuration handling
 # -----------------------------------------------------------------------------
 
-# Keys observed in .env (names only). Values may contain potentially sensitive data; do not log values.
 def _load_dotenv_pairs(path: str) -> List[Tuple[str, str]]:
-    """
-    Reads KEY=VALUE lines from a .env-like file. Preserves only simple key/value lines.
-    Comments and blank lines are ignored in the returned list, but retained during writes.
-    """
     pairs: List[Tuple[str, str]] = []
     if not os.path.exists(path):
         return pairs
@@ -149,7 +127,6 @@ def _load_dotenv_pairs(path: str) -> List[Tuple[str, str]]:
                     continue
                 key = m.group(1)
                 val = m.group(2)
-                # Remove optional surrounding quotes (simple heuristic)
                 if len(val) >= 2 and ((val[0] == val[-1] == '"') or (val[0] == val[-1] == "'")):
                     val = val[1:-1]
                 pairs.append((key, val))
@@ -159,7 +136,6 @@ def _load_dotenv_pairs(path: str) -> List[Tuple[str, str]]:
 
 
 def _load_dotenv_lines(path: str) -> List[str]:
-    """Returns all lines for write-back with minimal churn."""
     if not os.path.exists(path):
         return []
     try:
@@ -178,19 +154,13 @@ def _write_dotenv_lines(path: str, lines: List[str]) -> None:
 
 def _sanitize_env_value(v: str) -> str:
     v = v.replace("\r", "").replace("\n", "")
-    # Quote values containing spaces or special characters
     if re.search(r"\s|#|\"|'", v):
-        # Escape internal quotes
         vv = v.replace('"', '\\"')
         return f"\"{vv}\""
     return v
 
 
 def _secrets_denylist() -> List[re.Pattern]:
-    """
-    Denylist patterns for secret-like names. Case-insensitive.
-    Includes specific names plus generic suffix/prefix checks.
-    """
     patterns = [
         re.compile(r".*TOKEN.*", re.I),
         re.compile(r".*SECRET.*", re.I),
@@ -200,13 +170,7 @@ def _secrets_denylist() -> List[re.Pattern]:
         re.compile(r".*API[_-]?KEY.*", re.I),
         re.compile(r".*PRIVATE[_-]?KEY.*", re.I),
     ]
-    # Specific ones we always exclude
-    specifics = [
-        "NGROK_AUTHTOKEN",
-        "FLASK_SECRET",
-        "ADMIN_PASSWORD_HASH",
-    ]
-    for s in specifics:
+    for s in ["NGROK_AUTHTOKEN", "FLASK_SECRET", "ADMIN_PASSWORD_HASH"]:
         patterns.append(re.compile(rf"^{re.escape(s)}$", re.I))
     return patterns
 
@@ -224,22 +188,16 @@ def _current_env_editable_pairs() -> List[Tuple[str, str]]:
     for k, v in pairs:
         if _is_secret_key(k):
             continue
-        # Optionally avoid allowing admin username changes via UI to prevent lockouts
         if k.upper() in {"ADMIN_USER"}:
             continue
         editable.append((k, v))
-    # Keep stable ordering (alpha by key)
     editable.sort(key=lambda kv: kv[0])
     return editable
 
 
 def _apply_env_updates(updates: Dict[str, str]) -> None:
-    """
-    Apply updates to .env file for non-secret keys only, then refresh process env and runtime config.
-    """
     lines = _load_dotenv_lines(DOTENV_PATH)
     if not lines:
-        # Create new .env if needed
         lines = []
     existing_keys = {}
     for idx, raw in enumerate(lines):
@@ -253,7 +211,6 @@ def _apply_env_updates(updates: Dict[str, str]) -> None:
         sval = _sanitize_env_value(str(new_val))
         if key in existing_keys:
             idx = existing_keys[key]
-            # Preserve comment indentation if present
             prefix_ws = ""
             m = re.match(r"^(\s*)", lines[idx])
             if m:
@@ -261,12 +218,9 @@ def _apply_env_updates(updates: Dict[str, str]) -> None:
             lines[idx] = f"{prefix_ws}{key}={sval}"
         else:
             lines.append(f"{key}={sval}")
-
-        # Update process environment for immediate effect (best-effort)
         os.environ[key] = str(new_val)
 
     _write_dotenv_lines(DOTENV_PATH, lines)
-    # Reload runtime config dependent values
     _reload_runtime_from_env()
 
 
@@ -311,9 +265,6 @@ class Runtime:
         self.daily_max_attempts = max(1, _parse_int(os.environ.get("DAILY_MAX_ATTEMPTS_PER_DEST"), 12))
         self.backoff_strategy = (os.environ.get("BACKOFF_STRATEGY", "none") or "none").strip().lower()
 
-        # Jurisdiction / recording (surface only, call flow minimal here)
-        self.recording_mode = (os.environ.get("RECORDING_MODE", "off") or "off").strip().lower()
-
         # Twilio and webhooks
         self.public_base_url = os.environ.get("PUBLIC_BASE_URL", "").strip()
         self.use_ngrok = _parse_bool(os.environ.get("USE_NGROK"), False)
@@ -328,12 +279,11 @@ class Runtime:
         self.admin_user = os.environ.get("ADMIN_USER") or None
         self.admin_password_hash = os.environ.get("ADMIN_PASSWORD_HASH") or None
 
-        # AMD (acknowledged, not fully implemented)
+        # AMD and other
         self.amd_mode = (os.environ.get("AMD_MODE", "off") or "off").strip().lower()
         self.amd_timeout_seconds = max(3, _parse_int(os.environ.get("AMD_TIMEOUT_SECONDS"), 8))
         self.machine_behavior = (os.environ.get("MACHINE_BEHAVIOR", "hangup") or "hangup").strip().lower()
 
-        # Silence hangup (not used in this minimal flow)
         self.callee_silence_hangup_seconds = max(5, min(60, _parse_int(os.environ.get("CALLEE_SILENCE_HANGUP_SECONDS"), 10)))
 
 
@@ -347,18 +297,23 @@ def _reload_runtime_from_env() -> None:
         logging.info("Runtime configuration refreshed from environment.")
 
 
+def _normalize_dash(s: str) -> str:
+    return s.replace("\u2013", "-").replace("\u2014", "-")
+
+
 def _now_local() -> datetime:
     return datetime.now()
 
 
 def _parse_active_window(active_str: str) -> Tuple[int, int]:
     try:
+        active_str = _normalize_dash(active_str)
         s, e = active_str.split("-")
         hs, ms = [int(x) for x in s.strip().split(":")]
         he, me = [int(x) for x in e.strip().split(":")]
         return hs * 60 + ms, he * 60 + me
     except Exception:
-        return 9 * 60, 18 * 60  # default 09:00-18:00
+        return 9 * 60, 18 * 60
 
 
 def _within_active_window(now_dt: datetime) -> bool:
@@ -369,7 +324,6 @@ def _within_active_window(now_dt: datetime) -> bool:
     mins = now_dt.hour * 60 + now_dt.minute
     if start_min <= end_min:
         return start_min <= mins < end_min
-    # Overnight window case
     return mins >= start_min or mins < end_min
 
 
@@ -381,10 +335,6 @@ def _prune_attempts(now_ts: float, to_number: str) -> None:
 
 
 def _can_attempt(now_ts: float, to_number: str) -> Tuple[bool, int]:
-    """
-    Returns (allowed, wait_seconds).
-    wait_seconds > 0 indicates the time until a new attempt is allowed.
-    """
     _prune_attempts(now_ts, to_number)
     with _attempts_lock:
         lst = _dest_attempts.get(to_number, [])
@@ -430,7 +380,6 @@ def _ensure_twilio_client() -> Optional[Client]:
         logging.error("Twilio SDK not available. Install with: pip install twilio")
         return None
 
-    # Twilio credentials should be in real environment (not editable via UI)
     account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
     auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
     if not account_sid or not auth_token:
@@ -441,9 +390,6 @@ def _ensure_twilio_client() -> Optional[Client]:
 
 
 def initiate_outbound_call() -> Tuple[bool, str]:
-    """
-    Create an outbound call via Twilio. Returns (ok, message).
-    """
     client = _ensure_twilio_client()
     if client is None:
         return False, "Twilio client is not configured."
@@ -466,7 +412,7 @@ def initiate_outbound_call() -> Tuple[bool, str]:
             from_=from_number,
             url=answer_url,
             machine_detection="DetectMessageEnd" if _runtime.amd_mode in {"detect", "detect_hangup", "detect_message"} else None,
-            time_limit=300,  # upper bound; practical flow is short in this build
+            time_limit=300,
         )
         _note_attempt(time.time(), to_number)
         logging.info("Outbound call created. CallSid=%s to=%s from=%s", getattr(call, "sid", "?"), to_number, from_number)
@@ -486,9 +432,7 @@ def initiate_outbound_call() -> Tuple[bool, str]:
 def _rand_interval_seconds() -> int:
     lo = _runtime.min_interval_seconds
     hi = _runtime.max_interval_seconds
-    if hi <= lo:
-        return lo
-    return random.randint(lo, hi)
+    return lo if hi <= lo else random.randint(lo, hi)
 
 
 def _set_next_call_epoch(delta_s: int) -> None:
@@ -506,10 +450,8 @@ def _dialer_loop() -> None:
     _set_next_call_epoch(delay_s)
 
     while not _stop_requested.is_set():
-        # Wake up early if "call now" was requested.
         if _manual_call_requested.wait(timeout=1.0):
             _manual_call_requested.clear()
-            # Attempt immediately if within active window and caps permit.
             now = _now_local()
             if not _within_active_window(now):
                 logging.info("Call now rejected: outside active window.")
@@ -520,12 +462,10 @@ def _dialer_loop() -> None:
                 else:
                     ok, msg = initiate_outbound_call()
                     logging.info("Call now attempt: %s", msg)
-            # Re-arm next randomized delay after manual action
             delay_s = _rand_interval_seconds()
             _set_next_call_epoch(delay_s)
             continue
 
-        # Periodic check once per second
         now_ts = int(time.time())
         with _next_call_epoch_s_lock:
             due = _next_call_epoch_s is not None and now_ts >= _next_call_epoch_s
@@ -535,14 +475,12 @@ def _dialer_loop() -> None:
 
         now_local = _now_local()
         if not _within_active_window(now_local):
-            # Reschedule to next active window boundary
-            delay_s = 60  # check again shortly
+            delay_s = 60
             _set_next_call_epoch(delay_s)
             continue
 
         allowed, wait_s = _can_attempt(time.time(), _runtime.to_number)
         if not allowed:
-            # Respect caps; schedule another check after the wait or a minute if unknown
             delay_s = max(wait_s, 60)
             _set_next_call_epoch(delay_s)
             continue
@@ -550,7 +488,6 @@ def _dialer_loop() -> None:
         ok, msg = initiate_outbound_call()
         logging.info("Scheduled attempt: %s", msg)
 
-        # Reschedule next randomized interval
         delay_s = _rand_interval_seconds()
         _set_next_call_epoch(delay_s)
 
@@ -565,16 +502,10 @@ _dialer_thread = threading.Thread(target=_dialer_loop, name="dialer", daemon=Tru
 # -----------------------------------------------------------------------------
 
 def _admin_defaults() -> Tuple[str, Optional[str], bool]:
-    """
-    Returns (effective_user, effective_hash_or_none, uses_hash).
-    If .env ADMIN_USER and ADMIN_PASSWORD_HASH exist (and bcrypt available), prefer them.
-    Otherwise fall back to "bootycall"/"scammers" with no hash.
-    """
     env_user = (_runtime.admin_user or "").strip() if _runtime.admin_user else None
     env_hash = (_runtime.admin_password_hash or "").strip() if _runtime.admin_password_hash else None
     if env_user and env_hash and bcrypt is not None:
         return env_user, env_hash, True
-    # Default static credentials as requested
     return "bootycall", None, False
 
 
@@ -582,9 +513,9 @@ def _admin_authenticated() -> bool:
     return bool(session.get("is_admin") is True)
 
 
-def _require_admin() -> Optional[Response]:
+def _require_admin_for_api() -> Optional[Response]:
     if not _admin_authenticated():
-        return redirect(url_for("admin_login"))
+        return Response(json.dumps({"error": "unauthorized"}), status=401, mimetype="application/json")
     return None
 
 
@@ -609,7 +540,6 @@ def admin_login():
             return redirect(url_for("scamcalls"))
         return render_template("admin_login.html", error=None)
 
-    # POST
     username = (request.form.get("username") or "").strip()
     password = (request.form.get("password") or "").strip()
 
@@ -622,7 +552,6 @@ def admin_login():
             except Exception:
                 ok = False
     else:
-        # Fallback: "bootycall" / "scammers"
         ok = (username == effective_user and password == "scammers")
 
     if not ok:
@@ -638,19 +567,44 @@ def admin_logout():
     return redirect(url_for("scamcalls"))
 
 
+@app.route("/api/admin/env", methods=["GET"])
+def api_admin_env_get():
+    resp = _require_admin_for_api()
+    if resp:
+        return resp
+    editable = [{"key": k, "value": v} for (k, v) in _current_env_editable_pairs()]
+    return jsonify({"editable": editable})
+
+
+@app.route("/api/admin/env", methods=["POST"])
+def api_admin_env_post():
+    resp = _require_admin_for_api()
+    if resp:
+        return resp
+    try:
+        data = request.get_json(force=True, silent=False) or {}
+        updates = data.get("updates") or {}
+        if not isinstance(updates, dict):
+            return Response("Invalid payload.", status=400)
+        # Limit to string-like values
+        clean_updates = {str(k): "" if v is None else str(v) for k, v in updates.items()}
+        _apply_env_updates(clean_updates)
+        return jsonify({"ok": True})
+    except Exception as e:
+        logging.error("Failed to save env updates: %s", e)
+        return Response("Failed to save settings.", status=500)
+
+
 @app.route("/api/call-now", methods=["POST"])
 def api_call_now():
-    # Enforce caps and active window
     now_local = _now_local()
     if not _within_active_window(now_local):
-        # Allow silent rejection or a message. Here we return 200 with info to keep UI simple.
         return jsonify(ok=False, reason="outside_active_window", message="Outside active calling window."), 200
 
     allowed, wait_s = _can_attempt(time.time(), _runtime.to_number)
     if not allowed:
         return jsonify(ok=False, reason="cap_reached", wait_seconds=wait_s), 429
 
-    # Signal the dialer loop to attempt immediately
     _manual_call_requested.set()
     return jsonify(ok=True)
 
@@ -663,7 +617,6 @@ def api_next_greeting():
         data = {}
     phrase = (data.get("phrase") or "").strip()
 
-    # Validate 5–15 words
     words = [w for w in re.split(r"\s+", phrase) if w]
     if not (5 <= len(words) <= 15):
         return Response("Phrase must be between 5 and 15 words.", status=400)
@@ -676,10 +629,6 @@ def api_next_greeting():
 
 @app.route("/api/status", methods=["GET"])
 def api_status():
-    """
-    Provide scheduling and pacing status for the UI countdown.
-    Returns JSON with timing and cap information.
-    """
     now_i = int(time.time())
     with _next_call_epoch_s_lock:
         next_epoch = _next_call_epoch_s
@@ -724,6 +673,10 @@ def api_status():
         "wait_seconds_if_capped": wait_if_capped,
         "interval_total_seconds": interval_total,
         "interval_elapsed_seconds": interval_elapsed,
+        # Expose numbers for UI display
+        "to_number": _runtime.to_number,
+        "from_number": _runtime.from_number,
+        "from_numbers": _runtime.from_numbers,
     }
     return jsonify(payload)
 
@@ -744,10 +697,6 @@ def _xml_escape(s: str) -> str:
 
 @app.route("/twilio/answer", methods=["POST", "GET"])
 def twilio_answer():
-    """
-    Basic TwiML to speak one-time greeting (if provided) and a short default line.
-    This is intentionally simple to keep the call brief for this build.
-    """
     phrase = None
     global _ONE_SHOT_GREETING
     with _ONE_SHOT_GREETING_LOCK:
@@ -759,12 +708,10 @@ def twilio_answer():
     if phrase:
         greeting_lines.append(phrase)
     else:
-        # Default opening if no one-shot phrase is set
         greeting_lines.append(
             f"Hello, this is { _xml_escape(_runtime.company_name) }. I am calling about { _xml_escape(_runtime.topic) }."
         )
 
-    # Keep the response concise; in practice you may extend this with <Gather> etc.
     say_text = " ".join(greeting_lines)
     voice = _runtime.tts_voice or "man"
     lang = _runtime.tts_language or "en-US"
@@ -777,6 +724,54 @@ def twilio_answer():
 </Response>
 """
     return Response(xml, status=200, mimetype="text/xml")
+
+
+# -----------------------------------------------------------------------------
+# Ngrok support
+# -----------------------------------------------------------------------------
+
+def _start_ngrok_if_enabled() -> None:
+    global _active_tunnel_url
+    if not _runtime.use_ngrok:
+        return
+    if ngrok_lib is None:
+        logging.error("USE_NGROK=true but pyngrok is not installed. Install with: pip install pyngrok")
+        return
+
+    try:
+        port = int(os.environ.get("FLASK_PORT", "8080"))
+    except Exception:
+        port = 8080
+
+    token = os.environ.get("NGROK_AUTHTOKEN")
+    if token:
+        try:
+            ngrok_lib.set_auth_token(token)
+        except Exception as e:
+            logging.error("Failed to set ngrok auth token: %s", e)
+
+    try:
+        # Prefer TLS so PUBLIC_BASE_URL is https://...
+        tunnel = ngrok_lib.connect(addr=port, proto="http", bind_tls=True)
+        public_url = getattr(tunnel, "public_url", "") or ""
+        _active_tunnel_url = public_url
+        if public_url:
+            os.environ["PUBLIC_BASE_URL"] = public_url
+            _reload_runtime_from_env()
+            logging.info("ngrok tunnel established at %s", public_url)
+        else:
+            logging.error("ngrok did not return a public URL.")
+    except Exception as e:
+        logging.error("Failed to start ngrok tunnel: %s", e)
+
+
+@atexit.register
+def _shutdown_ngrok():
+    try:
+        if ngrok_lib is not None:
+            ngrok_lib.kill()
+    except Exception:
+        pass
 
 
 # -----------------------------------------------------------------------------
@@ -797,26 +792,21 @@ def _start_background_threads() -> None:
         _dialer_thread.start()
 
 
-@atexit.register
-def _shutdown():
-    _stop_requested.set()
-    if _dialer_thread.is_alive():
-        _dialer_thread.join(timeout=2.0)
-
-
 # -----------------------------------------------------------------------------
 # CLI entrypoint
 # -----------------------------------------------------------------------------
 def main():
-    # Informative log only; do not log environment values.
     logging.info("Scam Call Console starting.")
+
+    # Start ngrok (optional)
+    _start_ngrok_if_enabled()
+
     # Start background dialer
     _start_background_threads()
 
-    # Start Flask app
     host = os.environ.get("FLASK_HOST", "0.0.0.0")
     port = int(os.environ.get("FLASK_PORT", "8080"))
-    debug = _parse_bool(os.environ.get("FLASK_DEBUG"), False)
+    debug = (_parse_bool(os.environ.get("FLASK_DEBUG"), False))
     app.run(host=host, port=port, debug=debug, use_reloader=False)
 
 
