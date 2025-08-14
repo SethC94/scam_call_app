@@ -1,56 +1,30 @@
 (function () {
   "use strict";
 
+  // DOM helpers
   const qs = (sel, ctx = document) => ctx.querySelector(sel);
   const qsa = (sel, ctx = document) => Array.from(ctx.querySelectorAll(sel));
 
-  // Style for live panel blackout during active call
-  (function ensureStyle() {
-    const id = "live-convo-style";
-    if (qs(`#${id}`)) return;
-    const style = document.createElement("style");
-    style.id = id;
-    style.textContent = `
-      #livePanel .conversation {
-        transition: background-color .25s ease, box-shadow .25s ease, border-color .25s ease;
-      }
-      #livePanel.active .conversation {
-        background-color: rgba(0,0,0,0.78);
-        border: 1px solid rgba(255,255,255,0.08);
-        border-radius: 12px;
-        padding: 12px 14px;
-        box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02), 0 10px 30px rgba(0,0,0,0.35);
-      }
-      #livePanel .conv-line {
-        margin: .25rem 0;
-        line-height: 1.35;
-      }
-      #livePanel .conv-role {
-        font-weight: 600;
-        margin-right: .4rem;
-      }
-      #livePanel .conv-role.assistant { color: #7ec8ff; }
-      #livePanel .conv-role.callee { color: #ffd27e; }
-      #listenStatus { min-width: 9ch; text-align: right; }
-    `;
-    document.head.appendChild(style);
-  })();
-
+  // Toast helper
   function showToast(message, durationMs = 3200) {
     const el = qs("#toast");
     if (!el) return;
     el.textContent = message;
     el.classList.add("toast--show");
     clearTimeout(showToast._t);
-    showToast._t = setTimeout(() => el.classList.remove("toast--show"), durationMs);
+    showToast._t = setTimeout(() => {
+      el.classList.remove("toast--show");
+    }, durationMs);
   }
 
+  // Escaping for safe HTML insertion
   function escapeHtml(s) {
     return (s || "").replace(/[&<>"']/g, (c) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
     }[c]));
   }
 
+  // Format seconds to mm:ss
   function formatMMSS(totalSeconds) {
     const s = Math.max(0, Math.floor(totalSeconds || 0));
     const m = Math.floor(s / 60);
@@ -58,8 +32,9 @@
     return `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
   }
 
-  function buildCountdownBadge(remainSec, totalSec, paused) {
-    const size = 168;
+  // Build a large visual countdown ring as an SVG
+  function buildCountdownBadge(remainSec, totalSec, paused = false) {
+    const size = 168; // px
     const stroke = 10;
     const r = (size - stroke) / 2;
     const c = 2 * Math.PI * r;
@@ -80,11 +55,34 @@
       </svg>`;
   }
 
-  // Greeting modal
+  async function safeErrorText(res) {
+    try {
+      return await res.text();
+    } catch {
+      return "";
+    }
+  }
+
+  // -----------------------
+  // Greeting modal logic
+  // -----------------------
   const greetingModal = {
-    el: null, input: null, wordCountEl: null, saveBtn: null,
-    open() { this.el.setAttribute("aria-hidden", "false"); this.input.focus(); this.updateWordCount(); },
-    close() { this.el.setAttribute("aria-hidden", "true"); this.input.value = ""; this.updateWordCount(); },
+    el: null,
+    input: null,
+    wordCountEl: null,
+    saveBtn: null,
+    open() {
+      if (!this.el) return;
+      this.el.setAttribute("aria-hidden", "false");
+      this.input.focus();
+      this.updateWordCount();
+    },
+    close() {
+      if (!this.el) return;
+      this.el.setAttribute("aria-hidden", "true");
+      this.input.value = "";
+      this.updateWordCount();
+    },
     getWordCount() {
       const text = (this.input.value || "").trim();
       if (!text) return 0;
@@ -92,46 +90,67 @@
     },
     updateWordCount() {
       const n = this.getWordCount();
-      this.wordCountEl.textContent = `${n} words`;
-      this.saveBtn.disabled = n < 5 || n > 15;
+      if (this.wordCountEl) this.wordCountEl.textContent = `${n} words`;
+      if (this.saveBtn) this.saveBtn.disabled = n < 5 || n > 15;
     },
   };
 
   function initGreetingModal() {
-    const el = qs("#greetingModal");
-    if (!el) return;
-    greetingModal.el = el;
-    greetingModal.input = qs("#greetingInput", el);
-    greetingModal.wordCountEl = qs("#greetingWordCount", el);
-    greetingModal.saveBtn = qs("#greetingSaveBtn", el);
+    const modal = qs("#greetingModal");
+    if (!modal) return;
 
-    qs("#btnAddGreeting")?.addEventListener("click", () => greetingModal.open());
-    qs("#greetingCloseBtn")?.addEventListener("click", () => greetingModal.close());
-    qs("#greetingCancelBtn")?.addEventListener("click", () => greetingModal.close());
-    greetingModal.input?.addEventListener("input", () => greetingModal.updateWordCount());
+    greetingModal.el = modal;
+    greetingModal.input = qs("#greetingInput", modal);
+    greetingModal.wordCountEl = qs("#greetingWordCount", modal);
+    greetingModal.saveBtn = qs("#greetingSaveBtn", modal);
 
-    greetingModal.saveBtn?.addEventListener("click", async () => {
-      const phrase = (greetingModal.input.value || "").trim();
-      const words = greetingModal.getWordCount();
-      if (words < 5 || words > 15) {
-        showToast("Phrase must be between 5 and 15 words.");
-        return;
-      }
-      try {
-        const res = await fetch("/api/next-greeting", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ phrase }),
-        });
-        if (!res.ok) throw new Error((await res.text()) || "Failed to save greeting phrase.");
-        showToast("Greeting phrase queued for the next call.");
-        greetingModal.close();
-      } catch (err) {
-        showToast(err.message || "Failed to save greeting phrase.");
-      }
-    });
+    const openBtn = qs("#btnAddGreeting");
+    const closeBtn = qs("#greetingCloseBtn");
+    const cancelBtn = qs("#greetingCancelBtn");
+    const saveBtn = qs("#greetingSaveBtn");
+
+    if (greetingModal.input) {
+      greetingModal.input.addEventListener("input", () => greetingModal.updateWordCount());
+    }
+    if (openBtn) openBtn.addEventListener("click", () => greetingModal.open());
+    if (closeBtn) closeBtn.addEventListener("click", () => greetingModal.close());
+    if (cancelBtn) cancelBtn.addEventListener("click", () => greetingModal.close());
+
+    if (saveBtn) {
+      saveBtn.addEventListener("click", async () => {
+        const phrase = (greetingModal.input.value || "").trim();
+        const words = phrase.split(/\s+/).filter(Boolean);
+        if (words.length < 5 || words.length > 15) {
+          showToast("Enter 5 to 15 words.");
+          return;
+        }
+        saveBtn.disabled = true;
+        try {
+          const res = await fetch("/api/next-greeting", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ phrase }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || (data && data.ok === false)) {
+            const msg = (data && data.message) || (await safeErrorText(res));
+            showToast(msg || "Failed to save greeting phrase.");
+            return;
+          }
+          showToast("Greeting phrase queued for the next call.");
+          greetingModal.close();
+        } catch (err) {
+          showToast((err && err.message) || "Failed to save greeting phrase.");
+        } finally {
+          saveBtn.disabled = false;
+        }
+      });
+    }
   }
 
+  // -----------------------
+  // Call-now button wiring
+  // -----------------------
   function initCallNow() {
     const btn = qs("#btnCallNow");
     if (!btn) return;
@@ -140,32 +159,35 @@
       try {
         const res = await fetch("/api/call-now", { method: "POST" });
         const data = await res.json().catch(() => ({}));
-        if (res.status === 429 || (data && data.reason === "cap_reached")) {
+
+        if (res.status === 429 || (data && data.ok === false && data.reason === "cap_reached")) {
           showToast("Maximum call attempts reached for the allotted time.");
-          return;
-        }
-        if (data && data.ok) {
-          showToast("Call attempt requested.");
+        } else if (!res.ok || (data && data.ok === false)) {
+          const msg = (data && data.message) || await safeErrorText(res);
+          showToast(msg || "Call request failed.");
         } else {
-          showToast((data && data.message) || "Call request failed.");
+          showToast("Call attempt requested.");
         }
       } catch (err) {
-        showToast(err.message || "Call request failed.");
+        showToast((err && err.message) || "Call request failed.");
       } finally {
         btn.disabled = false;
       }
     });
   }
 
-  // Admin panel
+  // -----------------------
+  // Admin environment editor (matches /api/admin/env contract)
+  // -----------------------
   async function loadEnvEditor() {
     const container = qs("#envEditor");
     const isAdmin = document.body.getAttribute("data-is-admin") === "1";
     if (!container || !isAdmin) return;
+
     const endpoint = container.getAttribute("data-endpoint-get") || "/api/admin/env";
     container.setAttribute("aria-busy", "true");
     try {
-      const res = await fetch(endpoint, { method: "GET" });
+      const res = await fetch(endpoint, { method: "GET", cache: "no-cache" });
       if (!res.ok) throw new Error((await res.text()) || "Failed to load settings.");
       const data = await res.json();
       renderEnvTable(data.editable || []);
@@ -180,11 +202,13 @@
     const container = qs("#envEditor");
     if (!container) return;
     container.innerHTML = "";
+
     const table = document.createElement("table");
     table.className = "env-table";
     const thead = document.createElement("thead");
     thead.innerHTML = "<tr><th style='width:28%'>Key</th><th>Value</th></tr>";
     table.appendChild(thead);
+
     const tbody = document.createElement("tbody");
     items.forEach((row) => {
       const tr = document.createElement("tr");
@@ -236,6 +260,7 @@
       tr.appendChild(tdVal);
       tbody.appendChild(tr);
     });
+
     table.appendChild(tbody);
     container.appendChild(table);
 
@@ -247,6 +272,7 @@
     const container = qs("#envEditor");
     if (!container) return;
     const endpoint = container.getAttribute("data-endpoint-post") || "/api/admin/env";
+
     const inputs = qsa("input, select, textarea", container);
     const updates = {};
     inputs.forEach((el) => {
@@ -254,6 +280,7 @@
       if (!key) return;
       updates[key] = el.value;
     });
+
     try {
       const res = await fetch(endpoint, {
         method: "POST",
@@ -263,7 +290,7 @@
       if (!res.ok) throw new Error((await res.text()) || "Failed to save settings.");
       showToast("Settings saved.");
     } catch (err) {
-      showToast(err.message || "Failed to save settings.");
+      showToast((err && err.message) || "Failed to save settings.");
     }
   }
 
@@ -274,10 +301,11 @@
     qs("#btnSaveEnv")?.addEventListener("click", saveEnvEditor);
   }
 
-  // Global UI state
+  // -----------------------
+  // Status poller and UI (countdown + labels)
+  // -----------------------
   let statusTimer = null;
-  let liveTimer = null;
-  let callActive = false;
+  let callActive = false; // Tracks in-progress state when provided by backend
 
   function renderNumbersLine(data) {
     const to = data.to_number || "";
@@ -302,35 +330,18 @@
     </div>`;
   }
 
-  function buildStatusCard(data) {
-    const paused = !!data.call_in_progress;
-    let remain = data.seconds_until_next;
-    const total = data.interval_total_seconds || remain || 0;
-
-    const svg = buildCountdownBadge(remain ?? 0, total, paused);
-    const bigLabel = paused ? "Call in progress" : "Next attempt";
-    const smallLabel = paused ? "" : `in ${formatMMSS(remain ?? 0)}`;
-
-    const labelBlock =
-      `<div style="display:flex;flex-direction:column;justify-content:center">
-        <div style="font-size:1.05rem; line-height:1; font-weight:600; color:var(--text,#f3f5f7);">${bigLabel}</div>
-        <div style="font-size:1.6rem; line-height:1.2; font-variant-numeric: tabular-nums; color:var(--muted,#aab2bd);">${smallLabel}</div>
-        ${renderNumbersLine(data)}
-      </div>`;
-
-    return `
-      <div style="display:flex;align-items:center;gap:1rem;margin-top:.9rem">
-        <div style="flex:0 0 auto">${svg}</div>
-        <div style="flex:1 1 auto">${labelBlock}</div>
-      </div>`;
-  }
-
   function renderStatus(data) {
     const area = qs("#statusArea");
     if (!area) return;
 
+    // Track active call if backend reports it
+    if (typeof data.call_in_progress === "boolean") {
+      callActive = data.call_in_progress;
+    }
+
     const parts = [];
 
+    // Active window chip
     if (data.within_active_window) {
       parts.push(`<div class="chip" style="display:inline-flex;align-items:center;gap:.5rem;padding:.35rem .6rem;border:1px solid var(--border);border-radius:999px;background:rgba(0,0,0,.2);">
         <span style="width:.55rem;height:.55rem;border-radius:50%;background:var(--accent,#25c2a0);display:inline-block"></span>
@@ -343,21 +354,69 @@
       </div>`);
     }
 
-    parts.push(`<span class="muted" style="margin-left:.6rem">Attempts (1h/day): ${data.attempts_last_hour}/${data.hourly_max_attempts} · ${data.attempts_last_day}/${data.daily_max_attempts}</span>`);
+    // Attempts summary
+    parts.push(
+      `<span class="muted" style="margin-left:.6rem">Attempts (1h/day): ${data.attempts_last_hour}/${data.hourly_max_attempts} · ${data.attempts_last_day}/${data.daily_max_attempts}</span>`
+    );
 
-    area.innerHTML = `${parts.join(" ")} ${buildStatusCard(data)}`;
+    // Countdown logic
+    let remain = 0;
+    let total = 0;
+    if (!data.can_attempt_now && data.wait_seconds_if_capped > 0) {
+      remain = data.wait_seconds_if_capped;
+      total = data.wait_seconds_if_capped;
+    } else if (typeof data.seconds_until_next === "number" && data.seconds_until_next != null) {
+      remain = data.seconds_until_next;
+      total = (typeof data.interval_total_seconds === "number" && data.interval_total_seconds > 0)
+        ? data.interval_total_seconds
+        : (data.seconds_until_next || 0);
+    }
+
+    const paused = !data.within_active_window || !!callActive;
+    const svg = buildCountdownBadge(remain, total, paused);
+
+    let label = "";
+    if (callActive) {
+      label = "Calling now";
+    } else if (!data.within_active_window) {
+      label = "Waiting for active window";
+    } else if (!data.can_attempt_now && data.wait_seconds_if_capped > 0) {
+      label = "Waiting due to attempt cap";
+    } else if (typeof remain === "number") {
+      label = "Next attempt";
+    }
+
+    const labelBlock =
+      `<div style="display:flex;flex-direction:column;justify-content:center">
+        <div style="font-size:1.05rem; line-height:1; font-weight:600; color:var(--text,#f3f5f7);">${escapeHtml(label)}</div>
+        <div style="font-size:1.6rem; line-height:1.2; font-variant-numeric: tabular-nums; color:var(--muted,#aab2bd);">in ${formatMMSS(remain)}</div>
+        ${renderNumbersLine(data)}
+      </div>`;
+
+    const focal =
+      `<div style="display:flex;align-items:center;gap:1rem;margin-top:.9rem">
+        <div style="flex:0 0 auto">${svg}</div>
+        <div style="flex:1 1 auto">${labelBlock}</div>
+      </div>`;
+
+    area.innerHTML = `${parts.join(" ")} ${focal}`;
   }
 
   async function pollStatusOnce() {
     try {
       const res = await fetch("/api/status", { method: "GET", cache: "no-cache" });
-      if (!res.ok) throw new Error(await res.text() || "Failed to load status.");
+      if (!res.ok) throw new Error(await safeErrorText(res) || "Failed to load status.");
       const data = await res.json();
-      callActive = !!data.call_in_progress;
+
+      if (typeof data.call_in_progress === "boolean" && callActive !== true) {
+        callActive = data.call_in_progress;
+      }
       renderStatus(data);
     } catch {
       const area = qs("#statusArea");
-      if (area) area.innerHTML = `<div class="muted">Status unavailable.</div>`;
+      if (area) {
+        area.innerHTML = `<div class="muted">Status unavailable.</div>`;
+      }
     }
   }
 
@@ -370,7 +429,41 @@
     });
   }
 
-  // Live conversation UI
+  // -----------------------
+  // Live conversation UI (transcript + optional audio listen)
+  // -----------------------
+  // Style for live panel visuals
+  (function ensureLivePanelStyle() {
+    const id = "live-convo-style";
+    if (qs(`#${id}`)) return;
+    const style = document.createElement("style");
+    style.id = id;
+    style.textContent = `
+      #livePanel .conversation {
+        transition: background-color .25s ease, box-shadow .25s ease, border-color .25s ease;
+      }
+      #livePanel.active .conversation {
+        background-color: rgba(0,0,0,0.78);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 12px;
+        padding: 12px 14px;
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02), 0 10px 30px rgba(0,0,0,0.35);
+      }
+      #livePanel .conv-line {
+        margin: .25rem 0;
+        line-height: 1.35;
+      }
+      #livePanel .conv-role {
+        font-weight: 600;
+        margin-right: .4rem;
+      }
+      #livePanel .conv-role.assistant { color: #7ec8ff; }
+      #livePanel .conv-role.callee { color: #ffd27e; }
+      #listenStatus { min-width: 9ch; text-align: right; }
+    `;
+    document.head.appendChild(style);
+  })();
+
   let liveTimer = null;
   let ws = null;
   let audioCtx = null;
@@ -592,7 +685,9 @@
     if (document.hidden && ws) stopListening();
   });
 
-  // Boot
+  // -----------------------
+  // Init
+  // -----------------------
   document.addEventListener("DOMContentLoaded", () => {
     initGreetingModal();
     initCallNow();
