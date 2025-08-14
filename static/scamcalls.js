@@ -24,9 +24,9 @@
 
   // Larger focal countdown badge
   function buildCountdownBadge(remainSec, totalSec) {
-    // Larger size for focal point
-    const size = 112; // px
-    const stroke = 8;
+    // Increased size for better visibility
+    const size = 168; // px
+    const stroke = 10;
     const r = (size - stroke) / 2;
     const c = 2 * Math.PI * r;
 
@@ -311,9 +311,10 @@
 
     const toText = to || "Not configured";
 
-    return `<div class="muted" style="font-size:.95rem; margin-top:.5rem">
-      To: <span style="opacity:.9">${escapeHtml(toText)}</span>
-      &nbsp;&nbsp; From: <span style="opacity:.9">${escapeHtml(fromText)}</span>
+    // Subtle, readable display of the configured phone numbers
+    return `<div class="muted" style="font-size:.9rem; margin-top:.5rem; color:var(--muted,#aab2bd);">
+      To: <span style="opacity:.8; font-variant-numeric: tabular-nums;">${escapeHtml(toText)}</span>
+      &nbsp;&nbsp; From: <span style="opacity:.8; font-variant-numeric: tabular-nums;">${escapeHtml(fromText)}</span>
     </div>`;
   }
 
