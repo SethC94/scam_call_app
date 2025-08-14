@@ -29,6 +29,7 @@ import signal
 import logging
 import threading
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional, Tuple, Set, Dict, Any, List
 
 # Optional .env auto-load
@@ -78,6 +79,14 @@ try:
 except Exception:
     ROTATING_PROMPTS = []
 
+# File watching for hot reload
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    _HAS_WATCHDOG = True
+except Exception:
+    _HAS_WATCHDOG = False
+
 # Flask app and WebSocket sock
 app = Flask(__name__)
 sock = Sock(app)
@@ -87,6 +96,10 @@ _STOP_REQUESTED = False
 ANSI_BOLD = ""
 ANSI_CYAN = ""
 ANSI_RESET = ""
+
+# File watching and restart globals
+_RESTART_REQUESTED = threading.Event()
+_FILE_WATCH_ENABLED = False
 
 # Runtime configuration
 _TTS_VOICE: str = os.getenv("TTS_VOICE", "man").strip() or "man"
@@ -155,6 +168,9 @@ except ValueError:
 
 # Non-interactive, mirroring
 _NONINTERACTIVE = os.getenv("NONINTERACTIVE", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+# File watching and auto-restart configuration
+_AUTO_RESTART_ON_CHANGE = os.getenv("AUTO_RESTART_ON_CHANGE", "false").strip().lower() in {"1", "true", "yes", "on"}
 _MIRROR_DIR = os.getenv("MIRROR_TRANSCRIPTS_DIR", "").strip() or ""
 
 # History persistence (CSV)
@@ -788,6 +804,90 @@ def _assign_prompt_if_needed(call_sid: str) -> str:
         return d["prompt"]
 
 
+# ====== File watching and auto-restart functionality ======
+
+class MultiFileChangeHandler(FileSystemEventHandler):
+    """
+    File system event handler that watches for changes to Python, HTML, CSS, and JS files.
+    Triggers a restart only when no calls are active.
+    """
+    def __init__(self, watch_dirs: List[Path]) -> None:
+        super().__init__()
+        self.watch_dirs = [str(d) for d in watch_dirs]
+        self.watched_extensions = {'.py', '.html', '.css', '.js'}
+    
+    def on_modified(self, event):
+        if event.is_directory:
+            return
+        
+        file_path = Path(event.src_path)
+        if file_path.suffix.lower() in self.watched_extensions:
+            logging.info("File change detected: %s", file_path)
+            _RESTART_REQUESTED.set()
+
+def _is_app_idle() -> bool:
+    """Check if the application is idle (no active calls)"""
+    return _current_active_call() is None
+
+def _file_watch_thread() -> None:
+    """
+    File watching thread that monitors for file changes and triggers restart when idle.
+    """
+    if not _HAS_WATCHDOG:
+        logging.warning("Watchdog not available - file watching disabled")
+        return
+    
+    if not _AUTO_RESTART_ON_CHANGE:
+        logging.info("Auto-restart on file change is disabled")
+        return
+    
+    logging.info("Starting file watching for auto-restart")
+    
+    # Directories to watch
+    app_dir = Path(__file__).parent
+    watch_dirs = [
+        app_dir,  # Main directory (for .py files)
+        app_dir / "templates",  # Templates directory
+        app_dir / "static",  # Static files directory
+    ]
+    
+    # Only watch directories that exist
+    existing_dirs = [d for d in watch_dirs if d.exists()]
+    
+    if not existing_dirs:
+        logging.warning("No directories found to watch")
+        return
+    
+    observer = Observer()
+    handler = MultiFileChangeHandler(existing_dirs)
+    
+    # Schedule watching for each directory
+    for watch_dir in existing_dirs:
+        observer.schedule(handler, str(watch_dir), recursive=True)
+        logging.info("Watching directory: %s", watch_dir)
+    
+    observer.start()
+    
+    try:
+        while not _STOP_REQUESTED:
+            if _RESTART_REQUESTED.is_set():
+                # Check if app is idle before restarting
+                if _is_app_idle():
+                    logging.info("File changes detected and app is idle - restarting now")
+                    time.sleep(0.5)  # Brief delay before restart
+                    python = sys.executable
+                    os.execv(python, [python] + sys.argv)
+                else:
+                    logging.info("File changes detected but app has active calls - waiting for idle state")
+                    # Wait a bit and check again
+                    time.sleep(5)
+            else:
+                time.sleep(1)
+    finally:
+        observer.stop()
+        observer.join()
+
+
 # ====== TwiML endpoints ======
 
 @app.route("/voice", methods=["POST"])
@@ -1370,6 +1470,41 @@ def api_call_now() -> Response:
     return jsonify({"ok": True}), 200
 
 
+@app.route("/api/scamcalls/reload-status", methods=["GET"])
+def api_reload_status() -> Response:
+    """
+    Get the current reload/restart status
+    """
+    return jsonify({
+        "autoRestartEnabled": _AUTO_RESTART_ON_CHANGE,
+        "restartRequested": _RESTART_REQUESTED.is_set(),
+        "appIdle": _is_app_idle(),
+        "fileWatchEnabled": _FILE_WATCH_ENABLED,
+        "watchdogAvailable": _HAS_WATCHDOG
+    })
+
+
+@app.route("/api/scamcalls/reload-now", methods=["POST"])
+def api_reload_now() -> Response:
+    """
+    Request an immediate reload/restart if the app is idle
+    """
+    if not _is_app_idle():
+        return jsonify({
+            "ok": False, 
+            "error": "Cannot restart while calls are active",
+            "appIdle": False
+        }), 400
+    
+    logging.info("Manual restart requested via API")
+    _RESTART_REQUESTED.set()
+    
+    return jsonify({
+        "ok": True,
+        "message": "Restart scheduled - app will restart shortly"
+    })
+
+
 # ====== CLI setup and main loop ======
 
 def _sleep_with_manual_wake(wait_s: int) -> bool:
@@ -1499,6 +1634,18 @@ def main() -> int:
         "on" if _ENABLE_AMD else "off", _AMD_MODE, _AMD_TIMEOUT_S,
         "on" if _recording_enabled() else "off", _RECORDING_CHANNELS, len(_FROM_NUMBERS)
     )
+
+    # Start file watching thread if enabled
+    global _FILE_WATCH_ENABLED
+    if _AUTO_RESTART_ON_CHANGE and _HAS_WATCHDOG:
+        _FILE_WATCH_ENABLED = True
+        file_watch_thread = threading.Thread(target=_file_watch_thread, daemon=True)
+        file_watch_thread.start()
+        logging.info("File watching enabled - app will restart automatically on file changes when idle")
+    elif _AUTO_RESTART_ON_CHANGE and not _HAS_WATCHDOG:
+        logging.warning("Auto-restart requested but watchdog not available - file watching disabled")
+    else:
+        logging.info("File watching disabled (AUTO_RESTART_ON_CHANGE=false)")
 
     calls_made = 0
     while not _STOP_REQUESTED:

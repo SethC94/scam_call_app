@@ -2,3 +2,8 @@
 .env2
 .env
 .env2
+__pycache__/
+*.pyc
+*.pyo
+*.log
+call_history.csv
