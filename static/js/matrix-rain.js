@@ -32,7 +32,7 @@
   }
 
   function step() {
-    // Fade the canvas slightly to create trail effect
+    // Fade the canvas slightly to create a trail effect
     ctx.fillStyle = "rgba(0, 0, 0, 0.07)";
     ctx.fillRect(0, 0, width, height);
 
