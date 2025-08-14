@@ -114,9 +114,12 @@ _ONE_SHOT_GREETING_LOCK = threading.Lock()
 _attempts_lock = threading.Lock()
 _dest_attempts: Dict[str, List[float]] = {}  # to_number -> epoch list
 
-# Next randomized interval bookkeeping (for UI status if needed)
+# Next randomized interval bookkeeping (for UI status)
 _next_call_epoch_s_lock = threading.Lock()
 _next_call_epoch_s: Optional[int] = None
+# Track interval timing to enable progress visualization in UI
+_interval_start_epoch_s: Optional[int] = None
+_interval_total_seconds: Optional[int] = None
 
 # Twilio client
 _twilio_client: Optional[Client] = None
@@ -489,9 +492,12 @@ def _rand_interval_seconds() -> int:
 
 
 def _set_next_call_epoch(delta_s: int) -> None:
-    global _next_call_epoch_s
+    global _next_call_epoch_s, _interval_total_seconds, _interval_start_epoch_s
+    now_i = int(time.time())
     with _next_call_epoch_s_lock:
-        _next_call_epoch_s = int(time.time()) + max(0, int(delta_s))
+        _next_call_epoch_s = now_i + max(0, int(delta_s))
+        _interval_total_seconds = max(0, int(delta_s))
+        _interval_start_epoch_s = now_i
 
 
 def _dialer_loop() -> None:
@@ -668,38 +674,58 @@ def api_next_greeting():
     return jsonify(ok=True)
 
 
-@app.route("/api/admin/env", methods=["GET"])
-def api_admin_env_get():
-    req_auth = _require_admin()
-    if req_auth:
-        return req_auth
+@app.route("/api/status", methods=["GET"])
+def api_status():
+    """
+    Provide scheduling and pacing status for the UI countdown.
+    Returns JSON with timing and cap information.
+    """
+    now_i = int(time.time())
+    with _next_call_epoch_s_lock:
+        next_epoch = _next_call_epoch_s
+        interval_start = _interval_start_epoch_s
+        interval_total = _interval_total_seconds
 
-    editable = [{"key": k, "value": v} for (k, v) in _current_env_editable_pairs()]
-    return jsonify(editable=editable)
+    within = _within_active_window(_now_local())
 
+    to = _runtime.to_number
+    attempts_last_hour = 0
+    attempts_last_day = 0
+    can_attempt = True
+    wait_if_capped = 0
+    if to:
+        _prune_attempts(now_i, to)
+        with _attempts_lock:
+            lst = _dest_attempts.get(to, [])
+            attempts_last_hour = len([t for t in lst if t >= now_i - 3600])
+            attempts_last_day = len(lst)
+        can_attempt, wait_if_capped = _can_attempt(now_i, to)
 
-@app.route("/api/admin/env", methods=["POST"])
-def api_admin_env_post():
-    req_auth = _require_admin()
-    if req_auth:
-        return req_auth
+    seconds_until_next = None
+    if next_epoch is not None:
+        seconds_until_next = max(0, int(next_epoch - now_i))
 
-    try:
-        payload = request.get_json(force=True, silent=True) or {}
-        updates = payload.get("updates") or {}
-        # Ensure only str->str mapping is applied
-        normalized: Dict[str, str] = {}
-        for k, v in updates.items():
-            if not isinstance(k, str):
-                continue
-            if v is None:
-                continue
-            normalized[k] = str(v)
-        _apply_env_updates(normalized)
-        return jsonify(ok=True)
-    except Exception as e:
-        logging.error("Failed to save env updates: %s", e)
-        return Response("Failed to save settings.", status=500)
+    interval_elapsed = None
+    if interval_start is not None and interval_total is not None:
+        interval_elapsed = max(0, now_i - interval_start)
+
+    payload = {
+        "now_epoch": now_i,
+        "next_call_epoch": next_epoch,
+        "seconds_until_next": seconds_until_next,
+        "within_active_window": within,
+        "active_hours_local": _runtime.active_hours_local,
+        "active_days": _runtime.active_days,
+        "attempts_last_hour": attempts_last_hour,
+        "attempts_last_day": attempts_last_day,
+        "hourly_max_attempts": _runtime.hourly_max_attempts,
+        "daily_max_attempts": _runtime.daily_max_attempts,
+        "can_attempt_now": can_attempt,
+        "wait_seconds_if_capped": wait_if_capped,
+        "interval_total_seconds": interval_total,
+        "interval_elapsed_seconds": interval_elapsed,
+    }
+    return jsonify(payload)
 
 
 # -----------------------------------------------------------------------------
@@ -781,7 +807,6 @@ def _shutdown():
 # -----------------------------------------------------------------------------
 # CLI entrypoint
 # -----------------------------------------------------------------------------
-
 def main():
     # Informative log only; do not log environment values.
     logging.info("Scam Call Console starting.")
