@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Scam Call Console: Outbound caller service with admin UI, call pacing, and Twilio integration.
+Scam Call Console: Outbound caller service with admin UI, call pacing, Twilio voice, optional Media Streams,
+live transcript API, and clean shutdown.
 
-This build includes:
-- Valid Twilio voice routes (/voice, /transcribe, /transcribe-partial, /status) so calls play openings and capture speech.
-- Optional Twilio Media Streams (feature-flagged) to support live-listen; requires PUBLIC_BASE_URL and flask-sock in env.
-- One-shot greeting support wired to /api/next-greeting so the custom user-entered opening is actually spoken.
-- Admin .env editor (safe keys only).
-- Status API for the web UI.
-- Optional ngrok startup (USE_NGROK).
-- Clean shutdown on SIGINT/SIGTERM.
+Features:
+- Valid Twilio voice routes (/voice, /transcribe, /transcribe-partial, /status)
+- Live transcript storage and API: GET /api/live
+- Optional "Listen live" via Twilio Media Streams bridged to browser WebSocket (/client-audio)
+- Admin .env editor (safe keys)
+- Status API for UI
+- Optional ngrok (USE_NGROK)
+- Clean shutdown on SIGINT/SIGTERM
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 from flask import (
     Flask,
@@ -40,13 +41,13 @@ from flask import (
 )
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-# Optional bcrypt for admin auth with hash
+# Optional bcrypt for admin auth
 try:
     import bcrypt  # type: ignore
 except Exception:
     bcrypt = None
 
-# Twilio REST client (for call placement) and TwiML builders (for voice routes)
+# Twilio client and TwiML helpers
 try:
     from twilio.rest import Client  # type: ignore
 except Exception:
@@ -70,33 +71,18 @@ except Exception:
 _sock = None
 try:
     from flask_sock import Sock  # type: ignore
-    # We will instantiate Sock(app) after app is created
 except Exception:
     Sock = None  # type: ignore
 
-# -----------------------------------------------------------------------------
-# Flask app
-# -----------------------------------------------------------------------------
-
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1)  # type: ignore
-
-# Session secret
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
-
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
 
 TRUE_SET = {"1", "true", "yes", "on", "y", "t"}
 
@@ -159,21 +145,14 @@ def _overlay_env_from_dotenv(path: str) -> None:
         if k not in os.environ:
             os.environ[k] = v
 
-# Load .env values at startup (does not overwrite process env)
 _overlay_env_from_dotenv(".env")
-
-# -----------------------------------------------------------------------------
-# Runtime configuration
-# -----------------------------------------------------------------------------
 
 @dataclass
 class RuntimeConfig:
-    # Phone numbers
     to_number: str = ""
     from_number: str = ""
     from_numbers: List[str] = field(default_factory=list)
 
-    # Pacing and schedule
     active_hours_local: str = "09:00-18:00"
     active_days: List[str] = field(default_factory=lambda: ["Mon", "Tue", "Wed", "Thu", "Fri"])
     min_interval_seconds: int = 120
@@ -181,33 +160,26 @@ class RuntimeConfig:
     hourly_max_attempts: int = 3
     daily_max_attempts: int = 20
 
-    # Admin auth
     admin_user: Optional[str] = None
     admin_password_hash: Optional[str] = None
 
-    # Voice/TTS
     tts_voice: str = "man"
     tts_language: str = "en-US"
     rotate_prompts: bool = True
     rotate_prompts_strategy: str = "random"
 
-    # Business context
     company_name: str = ""
     topic: str = ""
 
-    # Call behavior
     callee_silence_hangup_seconds: int = 8
 
-    # Recording and jurisdiction toggles (non-secret)
     recording_mode: str = "off"
     recording_jurisdiction_mode: str = "disable_in_two_party"
 
-    # Networking
     public_base_url: Optional[str] = None
     use_ngrok: bool = False
-    enable_media_streams: bool = False  # feature flag
+    enable_media_streams: bool = False
 
-    # Flask/server
     flask_host: str = "0.0.0.0"
     flask_port: int = 8080
     flask_debug: bool = False
@@ -239,22 +211,22 @@ def _load_runtime_from_env() -> None:
     _runtime.active_days = [d for d in ([_normalize_day_name(x) for x in days]) if d]
 
     _runtime.min_interval_seconds = max(30, _parse_int(os.environ.get("MIN_INTERVAL_SECONDS"), 120))
-    _runtime.max_interval_seconds = max(
-        _runtime.min_interval_seconds,
-        _parse_int(os.environ.get("MAX_INTERVAL_SECONDS"), 420),
-    )
+    _runtime.max_interval_seconds = max(_runtime.min_interval_seconds, _parse_int(os.environ.get("MAX_INTERVAL_SECONDS"), 420))
     _runtime.hourly_max_attempts = max(1, _parse_int(os.environ.get("HOURLY_MAX_ATTEMPTS_PER_DEST"), 3))
     _runtime.daily_max_attempts = max(_runtime.hourly_max_attempts, _parse_int(os.environ.get("DAILY_MAX_ATTEMPTS_PER_DEST"), 20))
 
     _runtime.rotate_prompts = _parse_bool(os.environ.get("ROTATE_PROMPTS"), True)
     _runtime.rotate_prompts_strategy = (os.environ.get("ROTATE_PROMPTS_STRATEGY") or "random").strip().lower()
+
     _runtime.tts_voice = (os.environ.get("TTS_VOICE") or "man").strip()
     _runtime.tts_language = (os.environ.get("TTS_LANGUAGE") or "en-US").strip()
+
     _runtime.recording_mode = (os.environ.get("RECORDING_MODE") or "off").strip().lower()
     _runtime.recording_jurisdiction_mode = (os.environ.get("RECORDING_JURISDICTION_MODE") or "disable_in_two_party").strip().lower()
 
     _runtime.company_name = (os.environ.get("COMPANY_NAME") or "").strip()
     _runtime.topic = (os.environ.get("TOPIC") or "").strip()
+
     _runtime.callee_silence_hangup_seconds = max(3, min(60, _parse_int(os.environ.get("CALLEE_SILENCE_HANGUP_SECONDS"), 8)))
 
     _runtime.public_base_url = (os.environ.get("PUBLIC_BASE_URL") or "").strip() or None
@@ -266,10 +238,6 @@ def _load_runtime_from_env() -> None:
     _runtime.flask_debug = _parse_bool(os.environ.get("FLASK_DEBUG"), False)
 
 _load_runtime_from_env()
-
-# -----------------------------------------------------------------------------
-# Editable env configuration
-# -----------------------------------------------------------------------------
 
 _EDITABLE_ENV_KEYS = [
     "TO_NUMBER",
@@ -354,7 +322,6 @@ def _write_env_updates_preserving_comments(updates: Dict[str, str]) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         f.writelines(content)
         f.flush()
-        os.fsync(f.fileno())
     try:
         if env_path.exists():
             if bak.exists():
@@ -373,10 +340,6 @@ def _apply_env_updates(updates: Dict[str, str]) -> None:
         if k in _EDITABLE_ENV_KEYS and k not in _SECRET_ENV_KEYS:
             os.environ[k] = "" if v is None else str(v)
     _load_runtime_from_env()
-
-# -----------------------------------------------------------------------------
-# Attempt tracking and pacing
-# -----------------------------------------------------------------------------
 
 _attempts_lock = threading.Lock()
 _dest_attempts: Dict[str, List[float]] = {}
@@ -432,10 +395,6 @@ def _compute_next_interval_seconds() -> int:
         return lo
     return random.randint(lo, hi)
 
-# -----------------------------------------------------------------------------
-# Twilio placement helpers
-# -----------------------------------------------------------------------------
-
 _twilio_client: Optional[Client] = None
 
 def _ensure_twilio_client() -> Optional[Client]:
@@ -458,12 +417,9 @@ def _choose_from_number() -> Optional[str]:
         return random.choice(_runtime.from_numbers)
     return _runtime.from_number or None
 
-# -----------------------------------------------------------------------------
-# Background dialer
-# -----------------------------------------------------------------------------
-
 _manual_call_requested = threading.Event()
 _stop_requested = threading.Event()
+_dialer_thread = None  # set later
 
 def _dialer_loop() -> None:
     global _next_call_epoch_s, _interval_start_epoch_s, _interval_total_seconds
@@ -520,28 +476,31 @@ def _dialer_loop() -> None:
                 _next_call_epoch_s = now + int(_interval_total_seconds or 0)
     logging.info("Dialer thread stopped.")
 
-_dialer_thread = threading.Thread(target=_dialer_loop, name="dialer-thread", daemon=True)
-
-# -----------------------------------------------------------------------------
-# Conversation and transcripts
-# -----------------------------------------------------------------------------
-
+# Transcript storage
 _TRANSCRIPTS_LOCK = threading.Lock()
 _TRANSCRIPTS: Dict[str, List[Dict[str, Any]]] = {}
 
 def _append_transcript(call_sid: str, role: str, text: str, is_final: bool) -> None:
     if not text:
         return
-    entry = {
-        "t": time.time(),
-        "role": role,
-        "text": text,
-        "final": bool(is_final),
-    }
+    entry = {"t": time.time(), "role": role, "text": text, "final": bool(is_final)}
     with _TRANSCRIPTS_LOCK:
         _TRANSCRIPTS.setdefault(call_sid, []).append(entry)
 
-# One-shot opening line set by Admin action
+# Current call tracking
+_CURRENT_CALL_LOCK = threading.Lock()
+_CURRENT_CALL_SID: Optional[str] = None
+
+def _set_current_call_sid(sid: Optional[str]) -> None:
+    global _CURRENT_CALL_SID
+    with _CURRENT_CALL_LOCK:
+        _CURRENT_CALL_SID = sid
+
+def _get_current_call_sid() -> Optional[str]:
+    with _CURRENT_CALL_LOCK:
+        return _CURRENT_CALL_SID
+
+# One-shot opening line set via API
 _ONE_SHOT_GREETING: Optional[str] = None
 _ONE_SHOT_GREETING_LOCK = threading.Lock()
 
@@ -562,13 +521,10 @@ def _build_opening_lines() -> List[str]:
     if _runtime.topic:
         lines.append(f"I am calling about {_runtime.topic}.")
     if not lines:
-        lines.append("Hello, this is a quick call.")
+        lines.append("Hello.")
     return lines
 
-# -----------------------------------------------------------------------------
-# Admin authentication helpers
-# -----------------------------------------------------------------------------
-
+# Admin auth helpers
 def _admin_defaults() -> Tuple[str, Optional[str], bool]:
     env_user = (_runtime.admin_user or "").strip() if _runtime.admin_user else None
     env_hash = (_runtime.admin_password_hash or "").strip() if _runtime.admin_password_hash else None
@@ -584,10 +540,7 @@ def _require_admin_for_api() -> Optional[Response]:
         return Response(json.dumps({"error": "unauthorized"}), status=401, mimetype="application/json")
     return None
 
-# -----------------------------------------------------------------------------
 # UI routes
-# -----------------------------------------------------------------------------
-
 @app.route("/")
 def root():
     return redirect(url_for("scamcalls"))
@@ -624,10 +577,7 @@ def admin_logout():
     session.pop("is_admin", None)
     return redirect(url_for("scamcalls"))
 
-# -----------------------------------------------------------------------------
-# Admin: editable env
-# -----------------------------------------------------------------------------
-
+# Admin env editor
 @app.route("/api/admin/env", methods=["GET"])
 def api_admin_env_get():
     resp = _require_admin_for_api()
@@ -658,10 +608,7 @@ def api_admin_env_post():
         logging.error("Failed to save env updates: %s", e)
         return Response("Failed to save settings.", status=500)
 
-# -----------------------------------------------------------------------------
-# App status API (UI)
-# -----------------------------------------------------------------------------
-
+# UI status API
 @app.route("/api/status", methods=["GET"])
 def api_status():
     now_i = int(time.time())
@@ -709,10 +656,21 @@ def api_status():
     }
     return jsonify(payload)
 
-# -----------------------------------------------------------------------------
-# One-shot greeting setter
-# -----------------------------------------------------------------------------
+# Live transcript API
+@app.route("/api/live", methods=["GET"])
+def api_live_transcript():
+    sid = _get_current_call_sid()
+    with _TRANSCRIPTS_LOCK:
+        transcript = list(_TRANSCRIPTS.get(sid or "", [])) if sid else []
+    return jsonify({
+        "ok": True,
+        "in_progress": bool(sid),
+        "callSid": sid or "",
+        "transcript": transcript,
+        "media_streams_enabled": bool(_runtime.enable_media_streams),
+    })
 
+# One-shot greeting setter
 @app.route("/api/next-greeting", methods=["POST"])
 def api_next_greeting():
     try:
@@ -728,18 +686,19 @@ def api_next_greeting():
         _ONE_SHOT_GREETING = phrase
     return jsonify(ok=True)
 
-# -----------------------------------------------------------------------------
 # Twilio voice routes
-# -----------------------------------------------------------------------------
-
 @app.route("/voice", methods=["POST", "GET"])
 def voice_entrypoint():
-    # Always return valid TwiML to avoid Twilio "application error"
     if VoiceResponse is None:
         return Response("Server missing Twilio TwiML library.", status=500)
     vr = VoiceResponse()
 
-    # Optional: start Twilio Media Streams (requires ws handlers and flask-sock)
+    # Current call SID
+    call_sid = request.values.get("CallSid", "") or None
+    if call_sid:
+        _set_current_call_sid(call_sid)
+
+    # Optional Media Streams start
     if _runtime.enable_media_streams and Start is not None and Stream is not None and _runtime.public_base_url:
         try:
             start = Start()
@@ -750,10 +709,8 @@ def voice_entrypoint():
         except Exception as e:
             logging.warning("Failed to attach media streams: %s", e)
 
-    # Build opening lines (one-shot if set, else defaults)
-    call_sid = request.values.get("CallSid", "")
+    # Opening lines and barge-in gather
     opening_lines = _build_opening_lines()
-    # Gather with barge-in so the callee can interrupt while we speak
     g = Gather(
         input="speech",
         method="POST",
@@ -765,15 +722,13 @@ def voice_entrypoint():
         partial_result_callback_method="POST",
         language=_runtime.tts_language,
     )
-
     for i, line in enumerate(opening_lines):
         if not line:
             continue
-        _append_transcript(call_sid, "Assistant", line, is_final=True)
+        _append_transcript(call_sid or "", "Assistant", line, is_final=True)
         g.say(line, voice=_runtime.tts_voice, language=_runtime.tts_language)
         if i < len(opening_lines) - 1:
             g.pause(length=1)
-
     vr.append(g)
     return Response(str(vr), status=200, mimetype="text/xml")
 
@@ -781,13 +736,11 @@ def voice_entrypoint():
 def transcribe():
     if VoiceResponse is None:
         return Response("Server missing Twilio TwiML library.", status=500)
-    call_sid = request.values.get("CallSid", "")
+    call_sid = request.values.get("CallSid", "") or ""
     seq = int(request.args.get("seq", "1") or "1")
     speech_text = (request.values.get("SpeechResult") or "").strip()
     if speech_text:
         _append_transcript(call_sid, "Callee", speech_text, is_final=True)
-
-    # Simple dialog: acknowledge and end politely
     vr = VoiceResponse()
     reply = "Thank you for your time. Goodbye."
     _append_transcript(call_sid, "Assistant", reply, is_final=True)
@@ -797,7 +750,7 @@ def transcribe():
 
 @app.route("/transcribe-partial", methods=["POST"])
 def transcribe_partial():
-    call_sid = request.values.get("CallSid", "")
+    call_sid = request.values.get("CallSid", "") or ""
     part = (request.values.get("UnstableSpeechResult") or request.values.get("SpeechResult") or "").strip()
     if part:
         _append_transcript(call_sid, "Callee", part, is_final=False)
@@ -805,29 +758,39 @@ def transcribe_partial():
 
 @app.route("/status", methods=["POST"])
 def status_callback():
-    """
-    Twilio status callback: initiated, ringing, answered, completed, with AnsweredBy and SIP info if available.
-    """
-    call_sid = request.values.get("CallSid", "")
+    call_sid = request.values.get("CallSid", "") or ""
     call_status = (request.values.get("CallStatus") or "").lower()
     answered_by = request.values.get("AnsweredBy") or ""
     sip_code = request.values.get("SipResponseCode") or ""
     duration = request.values.get("CallDuration") or ""
-
-    logging.info(
-        "Status cb: sid=%s status=%s answered_by=%s sip=%s duration=%s",
-        call_sid, call_status, answered_by, sip_code, duration
-    )
+    logging.info("Status cb: sid=%s status=%s answered_by=%s sip=%s duration=%s", call_sid, call_status, answered_by, sip_code, duration)
+    if call_status == "completed":
+        _set_current_call_sid(None)
     return ("", 204)
 
-# -----------------------------------------------------------------------------
-# Optional Media Streams WebSocket handlers
-# -----------------------------------------------------------------------------
-
+# Optional Media Streams and client audio bridge
 if Sock is not None:
     _sock = Sock(app)
 else:
     _sock = None
+
+_AUDIO_CLIENTS_LOCK = threading.Lock()
+_AUDIO_CLIENTS: Set[Any] = set()
+
+def _broadcast_audio(payload_b64: str) -> None:
+    if not payload_b64:
+        return
+    with _AUDIO_CLIENTS_LOCK:
+        clients = list(_AUDIO_CLIENTS)
+    for ws in clients:
+        try:
+            ws.send(payload_b64)
+        except Exception:
+            try:
+                with _AUDIO_CLIENTS_LOCK:
+                    _AUDIO_CLIENTS.discard(ws)
+            except Exception:
+                pass
 
 if _sock is not None:
     @_sock.route("/media-in")
@@ -837,8 +800,14 @@ if _sock is not None:
                 msg = ws.receive()
                 if msg is None:
                     break
-                # Twilio sends JSON frames. For now, discard or log minimally.
-                # To support "listen live" to the browser, forward audio chunks to a client channel here.
+                try:
+                    data = json.loads(msg)
+                except Exception:
+                    continue
+                if data.get("event") == "media":
+                    payload = data.get("media", {}).get("payload", "")
+                    if payload:
+                        _broadcast_audio(payload)
         except Exception:
             pass
 
@@ -852,10 +821,23 @@ if _sock is not None:
         except Exception:
             pass
 
-# -----------------------------------------------------------------------------
-# Ngrok management (optional)
-# -----------------------------------------------------------------------------
+    @_sock.route("/client-audio")
+    def client_audio(ws):  # type: ignore
+        with _AUDIO_CLIENTS_LOCK:
+            _AUDIO_CLIENTS.add(ws)
+        try:
+            while True:
+                # Browser does not send; keep connection open
+                msg = ws.receive()
+                if msg is None:
+                    break
+        except Exception:
+            pass
+        finally:
+            with _AUDIO_CLIENTS_LOCK:
+                _AUDIO_CLIENTS.discard(ws)
 
+# Ngrok management
 _active_tunnel_url: Optional[str] = None
 
 def _start_ngrok_if_enabled() -> None:
@@ -885,10 +867,6 @@ def _shutdown_ngrok():
     except Exception:
         pass
 
-# -----------------------------------------------------------------------------
-# App lifecycle
-# -----------------------------------------------------------------------------
-
 def _handle_termination(signum, frame):
     logging.info("Termination signal received (%s). Stopping service.", signum)
     try:
@@ -900,12 +878,10 @@ signal.signal(signal.SIGTERM, _handle_termination)
 signal.signal(signal.SIGINT, _handle_termination)
 
 def _start_background_threads() -> None:
-    if not _dialer_thread.is_alive():
+    global _dialer_thread
+    if _dialer_thread is None or not _dialer_thread.is_alive():
+        _dialer_thread = threading.Thread(target=_dialer_loop, name="dialer-thread", daemon=True)
         _dialer_thread.start()
-
-# -----------------------------------------------------------------------------
-# CLI entrypoint
-# -----------------------------------------------------------------------------
 
 @app.route("/api/call-now", methods=["POST"])
 def api_call_now():
@@ -922,14 +898,8 @@ def api_call_now():
 
 def main():
     logging.info("Scam Call Console starting.")
-    # Initialize optional WebSocket server bindings (flask-sock already attached above if present)
-
-    # Start ngrok (optional)
     _start_ngrok_if_enabled()
-
-    # Start background dialer
     _start_background_threads()
-
     host = _runtime.flask_host or os.environ.get("FLASK_HOST", "0.0.0.0")
     port = int(_runtime.flask_port or _parse_int(os.environ.get("FLASK_PORT"), 8080))
     debug = bool(_runtime.flask_debug or _parse_bool(os.environ.get("FLASK_DEBUG"), False))
