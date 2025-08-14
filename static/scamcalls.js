@@ -474,7 +474,315 @@
     loadHistory();
   }
 
+  // ====== Admin Functionality ======
+  
+  let isAdminLoggedIn = false;
+
+  function showToast(message, duration = 3000) {
+    const toast = document.getElementById('toast');
+    toast.textContent = message;
+    toast.style.display = 'block';
+    setTimeout(() => {
+      toast.style.display = 'none';
+    }, duration);
+  }
+
+  function showModal(modalId) {
+    document.getElementById(modalId).classList.remove('hidden');
+  }
+
+  function hideModal(modalId) {
+    document.getElementById(modalId).classList.add('hidden');
+  }
+
+  async function adminLogin(username, password) {
+    try {
+      const response = await fetch('/api/admin/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password })
+      });
+      
+      if (response.ok) {
+        isAdminLoggedIn = true;
+        hideModal('adminLoginModal');
+        await loadAdminConfig();
+        document.getElementById('adminPanel').classList.remove('hidden');
+        showToast('Admin login successful');
+      } else {
+        const data = await response.json();
+        document.getElementById('loginError').textContent = data.error || 'Login failed';
+        document.getElementById('loginError').style.display = 'block';
+      }
+    } catch (error) {
+      document.getElementById('loginError').textContent = 'Login failed';
+      document.getElementById('loginError').style.display = 'block';
+    }
+  }
+
+  async function adminLogout() {
+    try {
+      await fetch('/api/admin/logout', { method: 'POST' });
+      isAdminLoggedIn = false;
+      document.getElementById('adminPanel').classList.add('hidden');
+      showToast('Logged out');
+    } catch (error) {
+      showToast('Logout failed');
+    }
+  }
+
+  async function loadAdminConfig() {
+    try {
+      const response = await fetch('/api/admin/config');
+      if (response.ok) {
+        const config = await response.json();
+        renderEnvConfig(config);
+      }
+    } catch (error) {
+      showToast('Failed to load configuration');
+    }
+  }
+
+  function renderEnvConfig(config) {
+    const container = document.getElementById('envConfigContainer');
+    container.innerHTML = '';
+    
+    Object.entries(config).forEach(([key, value]) => {
+      const div = document.createElement('div');
+      div.className = 'env-grid';
+      
+      const label = document.createElement('label');
+      label.textContent = key;
+      
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = value;
+      input.dataset.key = key;
+      
+      const status = document.createElement('span');
+      status.textContent = 'Current';
+      status.style.fontSize = '10px';
+      status.style.opacity = '0.6';
+      
+      div.appendChild(label);
+      div.appendChild(input);
+      div.appendChild(status);
+      container.appendChild(div);
+    });
+  }
+
+  async function saveAdminConfig() {
+    try {
+      const inputs = document.querySelectorAll('#envConfigContainer input');
+      const updates = {};
+      
+      inputs.forEach(input => {
+        updates[input.dataset.key] = input.value;
+      });
+      
+      const response = await fetch('/api/admin/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ updates })
+      });
+      
+      if (response.ok) {
+        showToast('Configuration saved');
+      } else {
+        showToast('Failed to save configuration');
+      }
+    } catch (error) {
+      showToast('Failed to save configuration');
+    }
+  }
+
+  async function restartApp() {
+    try {
+      const response = await fetch('/api/scamcalls/reload-now', { method: 'POST' });
+      if (response.ok) {
+        document.getElementById('restartStatus').textContent = 'Restart requested';
+        showToast('Restart requested');
+      }
+    } catch (error) {
+      showToast('Failed to request restart');
+    }
+  }
+
+  async function setGreetingPhrase(phrase) {
+    try {
+      const response = await fetch('/api/scamcalls/set-greeting', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phrase })
+      });
+      
+      if (response.ok) {
+        hideModal('greetingModal');
+        showToast('Greeting phrase set for next call');
+        document.getElementById('greetingText').value = '';
+      } else {
+        const data = await response.json();
+        document.getElementById('greetingError').textContent = data.error || 'Failed to set phrase';
+        document.getElementById('greetingError').style.display = 'block';
+      }
+    } catch (error) {
+      document.getElementById('greetingError').textContent = 'Failed to set phrase';
+      document.getElementById('greetingError').style.display = 'block';
+    }
+  }
+
+  function validateGreetingPhrase(text) {
+    const words = text.trim().split(/\s+/).filter(word => word.length > 0);
+    const wordCount = words.length;
+    document.getElementById('wordCount').textContent = `${wordCount} words`;
+    
+    if (wordCount === 0) {
+      return { valid: false, error: 'Please enter a phrase' };
+    } else if (wordCount < 5) {
+      return { valid: false, error: 'Phrase must be at least 5 words' };
+    } else if (wordCount > 15) {
+      return { valid: false, error: 'Phrase must be no more than 15 words' };
+    }
+    return { valid: true };
+  }
+
+  // Initialize admin functionality
+  function initAdminUI() {
+    // Admin button
+    const adminBtn = document.getElementById('adminBtn');
+    if (adminBtn) {
+      adminBtn.addEventListener('click', () => {
+        if (isAdminLoggedIn) {
+          adminLogout();
+        } else {
+          showModal('adminLoginModal');
+        }
+      });
+    }
+
+    // Admin login form
+    const loginForm = document.getElementById('adminLoginForm');
+    if (loginForm) {
+      loginForm.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const username = document.getElementById('adminUsername').value;
+        const password = document.getElementById('adminPassword').value;
+        adminLogin(username, password);
+      });
+    }
+
+    // Cancel login
+    const cancelLoginBtn = document.getElementById('cancelLoginBtn');
+    if (cancelLoginBtn) {
+      cancelLoginBtn.addEventListener('click', () => {
+        hideModal('adminLoginModal');
+        document.getElementById('loginError').style.display = 'none';
+      });
+    }
+
+    // Save config button
+    const saveConfigBtn = document.getElementById('saveConfigBtn');
+    if (saveConfigBtn) {
+      saveConfigBtn.addEventListener('click', saveAdminConfig);
+    }
+
+    // Restart button
+    const restartBtn = document.getElementById('restartBtn');
+    if (restartBtn) {
+      restartBtn.addEventListener('click', restartApp);
+    }
+
+    // Greeting button
+    const greetingBtn = document.getElementById('greetingBtn');
+    if (greetingBtn) {
+      greetingBtn.addEventListener('click', () => {
+        showModal('greetingModal');
+      });
+    }
+
+    // Greeting form
+    const greetingForm = document.getElementById('greetingForm');
+    if (greetingForm) {
+      greetingForm.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const phrase = document.getElementById('greetingText').value.trim();
+        const validation = validateGreetingPhrase(phrase);
+        
+        if (validation.valid) {
+          setGreetingPhrase(phrase);
+          document.getElementById('greetingError').style.display = 'none';
+        } else {
+          document.getElementById('greetingError').textContent = validation.error;
+          document.getElementById('greetingError').style.display = 'block';
+        }
+      });
+    }
+
+    // Cancel greeting
+    const cancelGreetingBtn = document.getElementById('cancelGreetingBtn');
+    if (cancelGreetingBtn) {
+      cancelGreetingBtn.addEventListener('click', () => {
+        hideModal('greetingModal');
+        document.getElementById('greetingError').style.display = 'none';
+        document.getElementById('greetingText').value = '';
+      });
+    }
+
+    // Word count update
+    const greetingText = document.getElementById('greetingText');
+    if (greetingText) {
+      greetingText.addEventListener('input', () => {
+        validateGreetingPhrase(greetingText.value);
+      });
+    }
+
+    // Click outside modal to close
+    document.addEventListener('click', (e) => {
+      if (e.target.classList.contains('modal-backdrop')) {
+        hideModal(e.target.id);
+        document.getElementById('loginError').style.display = 'none';
+        document.getElementById('greetingError').style.display = 'none';
+      }
+    });
+  }
+
+  // Enhanced call-now with cap checking
+  function enhanceCallNow() {
+    const callNowBtn = document.getElementById('callNowBtn');
+    if (callNowBtn) {
+      const originalHandler = callNowBtn.onclick;
+      callNowBtn.onclick = null;
+      
+      callNowBtn.addEventListener('click', async () => {
+        try {
+          callNowBtn.disabled = true;
+          const response = await fetch('/api/scamcalls/call-now', { method: 'POST' });
+          
+          if (response.status === 429) {
+            const data = await response.json();
+            if (data.code === 'cap') {
+              showToast('Max calls reached in allotted time. Don\'t over scam the scammer!');
+            }
+          } else if (response.ok) {
+            // Success case - let existing logic handle it
+          } else {
+            showToast('Failed to request call');
+          }
+          
+          setTimeout(() => { callNowBtn.disabled = false; }, 3000);
+        } catch (error) {
+          callNowBtn.disabled = false;
+          showToast('Failed to request call');
+        }
+      });
+    }
+  }
+
   const pageLive = isLivePage;
-  if (pageLive) initLivePage();
+  if (pageLive) {
+    initLivePage();
+    initAdminUI();
+    enhanceCallNow();
+  }
   if (isHistoryPage) initHistoryPage();
 })();

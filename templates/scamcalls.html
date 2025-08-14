@@ -5,6 +5,7 @@
     <title>Scam Call Monitor</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="icon" href="/static/favicon.ico" sizes="any" />
+    <link rel="stylesheet" href="/static/css/matrix.css" />
     <style>
       body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; background: #0b1820; color: #d4f1f9; }
       header { display: flex; align-items: center; justify-content: space-between; padding: 16px 24px; border-bottom: 1px solid rgba(255,255,255,0.06); }
@@ -33,6 +34,28 @@
       footer { margin-top: 16px; opacity: 0.7; font-size: 12px; }
       .caps { font-variant-numeric: tabular-nums; }
       .inline { display: inline-flex; align-items: center; gap: 8px; }
+      
+      /* Modal styles */
+      .modal-backdrop { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 1000; display: flex; align-items: center; justify-content: center; }
+      .modal { background: rgba(11, 24, 32, 0.95); border: 1px solid rgba(255,255,255,0.2); border-radius: 12px; padding: 24px; min-width: 400px; max-width: 90vw; }
+      .modal h3 { margin: 0 0 16px 0; color: #87f7cf; }
+      .modal label { display: block; margin-bottom: 8px; color: #d4f1f9; }
+      .modal input, .modal textarea { width: 100%; padding: 8px; border: 1px solid rgba(255,255,255,0.2); border-radius: 4px; background: rgba(0,0,0,0.3); color: #d4f1f9; }
+      .modal-actions { display: flex; gap: 8px; margin-top: 16px; justify-content: flex-end; }
+      .modal textarea { height: 80px; resize: vertical; }
+      
+      /* Toast notification */
+      .toast { position: fixed; top: 20px; right: 20px; background: rgba(255, 107, 107, 0.9); color: white; padding: 12px 16px; border-radius: 8px; z-index: 1001; display: none; }
+      
+      /* Admin panel */
+      .admin-panel { margin-top: 16px; padding: 16px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; }
+      .admin-panel h4 { margin: 0 0 12px 0; color: #87f7cf; }
+      .env-grid { display: grid; grid-template-columns: 200px 1fr 80px; gap: 8px; align-items: center; margin-bottom: 8px; }
+      .env-grid input { padding: 4px 8px; font-size: 12px; }
+      .env-grid label { font-size: 12px; }
+      
+      /* Hidden class */
+      .hidden { display: none; }
     </style>
   </head>
   <body data-page="scamcalls">
@@ -41,6 +64,7 @@
       <nav>
         <a href="/scamcalls" aria-current="page">Live</a>
         <a href="/scamcalls/history">History</a>
+        <button id="adminBtn" class="button">Admin</button>
       </nav>
     </header>
 
@@ -75,6 +99,7 @@
               </div>
               <div style="display:flex; flex-direction:column; gap:8px;">
                 <button id="callNowBtn" class="button primary" type="button">Call now</button>
+                <button id="greetingBtn" class="button" type="button">Add greeting phrase</button>
                 <div style="font-size: 12px; opacity: 0.8;">Served via: <span id="publicUrl">auto</span></div>
               </div>
             </div>
@@ -99,9 +124,67 @@
         <footer>
           <div id="appStatus">Status: Initializing...</div>
         </footer>
+        
+        <!-- Admin Settings Panel (hidden by default) -->
+        <div id="adminPanel" class="admin-panel hidden">
+          <h4>Admin Settings</h4>
+          <div id="envConfigContainer">
+            <!-- Environment variables will be loaded here -->
+          </div>
+          <div style="margin-top: 12px;">
+            <button id="saveConfigBtn" class="button">Save Configuration</button>
+            <button id="restartBtn" class="button">Restart App to Apply</button>
+            <span id="restartStatus" style="margin-left: 8px; font-size: 12px; opacity: 0.8;"></span>
+          </div>
+        </div>
       </div>
     </main>
 
+    <!-- Toast Notification -->
+    <div id="toast" class="toast"></div>
+
+    <!-- Admin Login Modal -->
+    <div id="adminLoginModal" class="modal-backdrop hidden">
+      <div class="modal">
+        <h3>Admin Login</h3>
+        <form id="adminLoginForm">
+          <label>
+            Username:
+            <input type="text" id="adminUsername" required>
+          </label>
+          <label>
+            Password:
+            <input type="password" id="adminPassword" required>
+          </label>
+          <div id="loginError" style="color: #ff6b6b; margin-top: 8px; display: none;"></div>
+          <div class="modal-actions">
+            <button type="button" id="cancelLoginBtn" class="button">Cancel</button>
+            <button type="submit" class="button primary">Login</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Greeting Phrase Modal -->
+    <div id="greetingModal" class="modal-backdrop hidden">
+      <div class="modal">
+        <h3>Add Greeting Phrase</h3>
+        <form id="greetingForm">
+          <label>
+            Greeting phrase (5-15 words):
+            <textarea id="greetingText" placeholder="Enter a custom greeting phrase for the next call..."></textarea>
+          </label>
+          <div id="greetingError" style="color: #ff6b6b; margin-top: 8px; display: none;"></div>
+          <div id="wordCount" style="font-size: 12px; opacity: 0.8; margin-top: 4px;">0 words</div>
+          <div class="modal-actions">
+            <button type="button" id="cancelGreetingBtn" class="button">Cancel</button>
+            <button type="submit" class="button primary">Save Phrase</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <script src="/static/js/matrix.js"></script>
     <script src="/static/scamcalls.js"></script>
   </body>
 </html>

@@ -28,6 +28,9 @@ import random
 import signal
 import logging
 import threading
+import hashlib
+import secrets
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, Set, Dict, Any, List
 
@@ -41,7 +44,7 @@ except Exception:
 # Ensure pyngrok uses local binary if set (optional)
 os.environ.setdefault("NGROK_PATH", "/opt/homebrew/bin/ngrok")
 
-from flask import Flask, request, Response, render_template, jsonify, send_from_directory
+from flask import Flask, request, Response, render_template, jsonify, send_from_directory, session
 
 # WebSockets
 try:
@@ -81,6 +84,32 @@ except Exception:
 # Flask app and WebSocket sock
 app = Flask(__name__)
 sock = Sock(app)
+
+# Session configuration for admin login
+app.secret_key = os.getenv("ADMIN_SESSION_SECRET", secrets.token_hex(32))
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SECURE'] = False  # Set to True in production with HTTPS
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=24)
+
+# Admin configuration
+_ADMIN_USERNAME = "bootycall"
+_ADMIN_PASSWORD = "scammers"
+_admin_failed_attempts: Dict[str, List[float]] = {}
+_admin_lockout_until: Dict[str, float] = {}
+
+# Environment variables that are safe to edit (exclude secrets)
+_SECRET_PATTERNS = {
+    "token", "secret", "password", "pass", "auth", "key", "sid", 
+    "authtoken", "account_sid", "auth_token"
+}
+
+# Manual greeting phrase storage (consumed on next call)
+_manual_greeting_phrase: Optional[str] = None
+_greeting_lock = threading.Lock()
+
+# Reload status tracking
+_reload_requested = False
+_reload_status_lock = threading.Lock()
 
 # Globals
 _STOP_REQUESTED = False
@@ -358,7 +387,7 @@ def _finalize_transcript(call_sid: str) -> str:
     if full_text:
         logging.info("\n%s\n%s\n%s", header, full_text, footer)
     else:
-        logging.info("\%s\n%s\n%s", header, "<no speech captured>", footer)
+        logging.info("\n%s\n%s\n%s", header, "<no speech captured>", footer)
     return full_text
 
 
@@ -757,6 +786,12 @@ def _default_prompt_text() -> str:
 
 
 def _next_prompt() -> str:
+    # Check for manual greeting phrase first (one-time use)
+    manual_greeting = _consume_manual_greeting()
+    if manual_greeting:
+        logging.info("Using manual greeting phrase: %s", manual_greeting)
+        return manual_greeting
+    
     if not _ROTATE_PROMPTS:
         return _default_prompt_text()
     local_list = _prompts_list if _prompts_list else []
@@ -1243,6 +1278,87 @@ def recording_status_handler() -> Response:
     return Response("", status=204)
 
 
+# ====== Admin Functions ======
+
+def _get_client_ip() -> str:
+    """Get client IP address from request"""
+    return request.environ.get('HTTP_X_FORWARDED_FOR', request.environ.get('REMOTE_ADDR', ''))
+
+def _is_admin_locked_out(ip: str) -> bool:
+    """Check if admin IP is locked out due to failed attempts"""
+    now = time.time()
+    lockout_until = _admin_lockout_until.get(ip, 0)
+    return now < lockout_until
+
+def _record_admin_failure(ip: str) -> None:
+    """Record a failed admin login attempt"""
+    now = time.time()
+    attempts = _admin_failed_attempts.setdefault(ip, [])
+    # Keep only attempts from last 5 minutes
+    attempts[:] = [t for t in attempts if t > now - 300]
+    attempts.append(now)
+    
+    # Lock out after 5 failed attempts for 5 minutes
+    if len(attempts) >= 5:
+        _admin_lockout_until[ip] = now + 300  # 5 minutes
+
+def _clear_admin_failures(ip: str) -> None:
+    """Clear failed attempts for successful login"""
+    _admin_failed_attempts.pop(ip, None)
+    _admin_lockout_until.pop(ip, None)
+
+def _is_secret_env_var(key: str) -> bool:
+    """Check if environment variable key contains secret patterns"""
+    key_lower = key.lower()
+    return any(pattern in key_lower for pattern in _SECRET_PATTERNS)
+
+def _get_safe_env_vars() -> Dict[str, str]:
+    """Get environment variables that are safe to edit (exclude secrets)"""
+    safe_vars = {}
+    for key, value in os.environ.items():
+        if not _is_secret_env_var(key):
+            safe_vars[key] = value
+    return safe_vars
+
+def _update_env_file(updates: Dict[str, str]) -> None:
+    """Update .env file with new values"""
+    env_path = Path(".env")
+    
+    # Read existing .env file
+    existing_lines = []
+    existing_vars = {}
+    if env_path.exists():
+        with open(env_path, 'r', encoding='utf-8') as f:
+            existing_lines = f.read().splitlines()
+        
+        for line in existing_lines:
+            if '=' in line and not line.strip().startswith('#'):
+                key, value = line.split('=', 1)
+                existing_vars[key.strip()] = value
+
+    # Update with new values (only safe vars)
+    for key, value in updates.items():
+        if not _is_secret_env_var(key):
+            existing_vars[key] = value
+
+    # Write back to .env file
+    with open(env_path, 'w', encoding='utf-8') as f:
+        for key, value in existing_vars.items():
+            f.write(f"{key}={value}\n")
+
+def _is_admin() -> bool:
+    """Check if current session is authenticated as admin"""
+    return session.get('is_admin') is True
+
+def _consume_manual_greeting() -> Optional[str]:
+    """Get and clear the manual greeting phrase (one-time use)"""
+    global _manual_greeting_phrase
+    with _greeting_lock:
+        phrase = _manual_greeting_phrase
+        _manual_greeting_phrase = None
+        return phrase
+
+
 # ====== Web UI pages and favicon ======
 
 @app.route("/scamcalls", methods=["GET"])
@@ -1258,6 +1374,115 @@ def ui_history_page() -> Response:
 @app.route("/favicon.ico")
 def favicon_compat() -> Response:
     return send_from_directory(os.path.join(app.root_path, "static"), "favicon.ico", mimetype="image/x-icon")
+
+
+# ====== Admin API Endpoints ======
+
+@app.route("/api/admin/login", methods=["POST"])
+def api_admin_login() -> Response:
+    """Admin login endpoint"""
+    ip = _get_client_ip()
+    
+    # Check if IP is locked out
+    if _is_admin_locked_out(ip):
+        return jsonify({"error": "Too many failed attempts. Try again later."}), 429
+    
+    try:
+        data = request.get_json() or {}
+        username = data.get('username', '')
+        password = data.get('password', '')
+        
+        if username == _ADMIN_USERNAME and password == _ADMIN_PASSWORD:
+            _clear_admin_failures(ip)
+            session['is_admin'] = True
+            session.permanent = True
+            return jsonify({"ok": True})
+        else:
+            _record_admin_failure(ip)
+            return jsonify({"error": "Invalid credentials"}), 401
+            
+    except Exception as e:
+        logging.error("Admin login error: %s", str(e))
+        return jsonify({"error": "Login failed"}), 500
+
+@app.route("/api/admin/logout", methods=["POST"])
+def api_admin_logout() -> Response:
+    """Admin logout endpoint"""
+    session.clear()
+    return jsonify({"ok": True})
+
+@app.route("/api/admin/config", methods=["GET"])
+def api_admin_config_get() -> Response:
+    """Get safe environment variables for admin editing"""
+    if not _is_admin():
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    safe_vars = _get_safe_env_vars()
+    return jsonify(safe_vars)
+
+@app.route("/api/admin/config", methods=["POST"])
+def api_admin_config_post() -> Response:
+    """Update environment variables"""
+    if not _is_admin():
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    try:
+        data = request.get_json() or {}
+        updates = data.get('updates', {})
+        
+        # Only allow updates to safe variables
+        safe_updates = {k: v for k, v in updates.items() if not _is_secret_env_var(k)}
+        
+        _update_env_file(safe_updates)
+        return jsonify({"ok": True})
+        
+    except Exception as e:
+        logging.error("Admin config update error: %s", str(e))
+        return jsonify({"error": "Update failed"}), 500
+
+@app.route("/api/scamcalls/set-greeting", methods=["POST"])
+def api_set_greeting() -> Response:
+    """Set manual greeting phrase for next call"""
+    try:
+        data = request.get_json() or {}
+        phrase = data.get('phrase', '').strip()
+        
+        if not phrase:
+            return jsonify({"error": "Phrase cannot be empty"}), 400
+        
+        # Validate word count (5-15 words)
+        word_count = len(phrase.split())
+        if word_count < 5 or word_count > 15:
+            return jsonify({"error": "Phrase must be 5-15 words"}), 400
+        
+        global _manual_greeting_phrase
+        with _greeting_lock:
+            _manual_greeting_phrase = phrase
+        
+        return jsonify({"ok": True})
+        
+    except Exception as e:
+        logging.error("Set greeting error: %s", str(e))
+        return jsonify({"error": "Failed to set greeting"}), 500
+
+@app.route("/api/scamcalls/reload-now", methods=["POST"])
+def api_reload_now() -> Response:
+    """Request application reload"""
+    global _reload_requested
+    with _reload_status_lock:
+        _reload_requested = True
+    
+    # In a production app, this would trigger a graceful restart
+    # For now, we just set a flag that can be checked
+    logging.info("Application reload requested")
+    return jsonify({"ok": True, "message": "Reload requested"})
+
+@app.route("/api/scamcalls/reload-status", methods=["GET"])
+def api_reload_status() -> Response:
+    """Get reload status"""
+    with _reload_status_lock:
+        status = "pending" if _reload_requested else "ready"
+    return jsonify({"status": status})
 
 
 # ====== Web UI APIs ======
@@ -1300,6 +1525,12 @@ def _segments_to_messages(call_sid: str, include_partial: bool = True) -> List[D
 @app.route("/api/scamcalls/status", methods=["GET"])
 def api_status() -> Response:
     active_sid = _current_active_call()
+    
+    # Include manual greeting if set
+    next_greeting = None
+    with _greeting_lock:
+        next_greeting = _manual_greeting_phrase
+    
     data = {
         "active": bool(active_sid),
         "callSid": active_sid,
@@ -1310,6 +1541,7 @@ def api_status() -> Response:
         "activeWindow": _format_active_window_label(),
         "caps": {"hourly": _HOURLY_MAX_PER_DEST, "daily": _DAILY_MAX_PER_DEST},
         "publicUrl": _PUBLIC_BASE_URL or "",
+        "nextGreeting": next_greeting,
     }
     return jsonify(data)
 
@@ -1365,6 +1597,16 @@ def api_transcript(call_sid: str) -> Response:
 
 @app.route("/api/scamcalls/call-now", methods=["POST"])
 def api_call_now() -> Response:
+    # Check if call can be attempted now (caps/backoff)
+    if _DEST_NUMBER:
+        allowed, wait_time = _can_attempt(time.time(), _DEST_NUMBER)
+        if not allowed:
+            return jsonify({
+                "error": "Max calls reached in allotted time.",
+                "code": "cap",
+                "waitSeconds": wait_time
+            }), 429
+    
     _manual_call_requested.set()
     logging.info("Call-now requested via API.")
     return jsonify({"ok": True}), 200
