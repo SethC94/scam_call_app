@@ -3,11 +3,11 @@
 Scam Call Console: Outbound caller service with admin UI, pacing, Twilio voice,
 optional Media Streams, live transcript API, and clean shutdown.
 
-Updates in this version:
-- Add call_in_progress to /api/status to let the UI pause the countdown.
-- Auto-dial when schedule reaches zero; prevent overlapping calls.
-- Reset schedule on call completion.
-- Retain live transcript API and Media Streams bridge for "Listen live".
+Updates:
+- Prevent overlapping calls using an "outgoing pending" guard with expiry.
+- Backend is the single source of auto-dial at countdown zero (UI no longer auto-dials).
+- Pause countdown and mark call_in_progress while pending or active.
+- Reset schedule on call completion only.
 """
 
 from __future__ import annotations
@@ -433,9 +433,14 @@ _manual_call_requested = threading.Event()
 _stop_requested = threading.Event()
 _dialer_thread = None  # started in main()
 
-# Track active call for UI and to prevent overlapping attempts
+# Track active and pending (pre-callback) call states
 _CURRENT_CALL_LOCK = threading.Lock()
 _CURRENT_CALL_SID: Optional[str] = None
+
+# Pending is used to block duplicate placements between calls.create and Twilio callbacks
+_PENDING_LOCK = threading.Lock()
+_PENDING_UNTIL_TS: Optional[float] = None
+_PENDING_TTL_SECONDS = 90.0  # safety window; auto-clears on /status initiated or /voice
 
 def _set_current_call_sid(sid: Optional[str]) -> None:
     global _CURRENT_CALL_SID
@@ -446,10 +451,33 @@ def _get_current_call_sid() -> Optional[str]:
     with _CURRENT_CALL_LOCK:
         return _CURRENT_CALL_SID
 
+def _mark_outgoing_pending() -> None:
+    global _PENDING_UNTIL_TS
+    with _PENDING_LOCK:
+        _PENDING_UNTIL_TS = time.time() + _PENDING_TTL_SECONDS
+
+def _clear_outgoing_pending() -> None:
+    global _PENDING_UNTIL_TS
+    with _PENDING_LOCK:
+        _PENDING_UNTIL_TS = None
+
+def _is_outgoing_pending() -> bool:
+    with _PENDING_LOCK:
+        if _PENDING_UNTIL_TS is None:
+            return False
+        if time.time() >= _PENDING_UNTIL_TS:
+            # expired
+            _PENDING_UNTIL_TS = None
+            return False
+        return True
+
+def _is_call_busy() -> bool:
+    return (_get_current_call_sid() is not None) or _is_outgoing_pending()
+
 def _place_call_now() -> bool:
     """
     Attempt to place a call once, returning True if Twilio accepted the request.
-    Does not retry on error.
+    Sets 'outgoing pending' immediately to prevent duplicates before callbacks.
     """
     client = _ensure_twilio_client()
     from_n = _choose_from_number()
@@ -467,73 +495,69 @@ def _place_call_now() -> bool:
         )
         logging.info("Placed call: %s", getattr(call, "sid", "<sid>"))
         _note_attempt(time.time(), _runtime.to_number)
+        _mark_outgoing_pending()
         return True
     except Exception as e:
         logging.error("Twilio call placement failed: %s", e)
         return False
 
-def _dialer_loop() -> None:
+def _initialize_schedule_if_needed(now: int) -> None:
     global _next_call_epoch_s, _interval_start_epoch_s, _interval_total_seconds
+    with _next_call_epoch_s_lock:
+        if _next_call_epoch_s is None:
+            _interval_total_seconds = _compute_next_interval_seconds()
+            _interval_start_epoch_s = now
+            _next_call_epoch_s = now + int(_interval_total_seconds or 0)
+
+def _reset_schedule_after_completion(now: int) -> None:
+    global _next_call_epoch_s, _interval_start_epoch_s, _interval_total_seconds
+    with _next_call_epoch_s_lock:
+        interval = _compute_next_interval_seconds()
+        _interval_total_seconds = interval
+        _interval_start_epoch_s = now
+        _next_call_epoch_s = now + int(interval)
+
+def _dialer_loop() -> None:
     logging.info("Dialer thread started.")
     while not _stop_requested.is_set():
         now = int(time.time())
-        # Initialize schedule if needed
-        with _next_call_epoch_s_lock:
-            if _next_call_epoch_s is None:
-                _interval_total_seconds = _compute_next_interval_seconds()
-                _interval_start_epoch_s = now
-                _next_call_epoch_s = now + int(_interval_total_seconds or 0)
+        _initialize_schedule_if_needed(now)
 
-        # Manual request handling
+        # Manual request
         if _manual_call_requested.is_set():
             _manual_call_requested.clear()
             if _runtime.to_number:
-                if _get_current_call_sid() is None and _within_active_window(_now_local()):
+                if not _is_call_busy() and _within_active_window(_now_local()):
                     can, wait_s = _can_attempt(now, _runtime.to_number)
                     if can:
                         ok = _place_call_now()
-                        if ok:
-                            # Next interval is set when the call completes; do not advance now
-                            pass
+                        if not ok:
+                            # On failure, reschedule to try later
+                            _reset_schedule_after_completion(now)
                     else:
                         logging.info("Attempt capped; wait %ss.", wait_s)
                 else:
-                    logging.info("Call in progress or outside active window; manual attempt suppressed.")
+                    logging.info("Call busy or outside active window; manual attempt suppressed.")
             else:
                 logging.info("TO_NUMBER not configured; manual attempt ignored.")
 
         # Automatic schedule-based attempt
-        # Only attempt when: schedule elapsed, within window, destination configured, and no call in progress
         with _next_call_epoch_s_lock:
             ready = (_next_call_epoch_s is not None and now >= _next_call_epoch_s)
-        if ready and _runtime.to_number and _get_current_call_sid() is None and _within_active_window(_now_local()):
+        if ready and _runtime.to_number and not _is_call_busy() and _within_active_window(_now_local()):
             can, _ = _can_attempt(now, _runtime.to_number)
             if can:
                 ok = _place_call_now()
-                if ok:
-                    # Do not advance schedule here; we will reset schedule on call completion
-                    pass
-                else:
-                    # If failed to place, schedule a short retry backoff
-                    with _next_call_epoch_s_lock:
-                        _interval_total_seconds = _compute_next_interval_seconds()
-                        _interval_start_epoch_s = now
-                        _next_call_epoch_s = now + int(_interval_total_seconds or 0)
-
+                if not ok:
+                    _reset_schedule_after_completion(now)
             else:
-                # Respect caps; reschedule to check later
-                with _next_call_epoch_s_lock:
-                    _interval_total_seconds = _compute_next_interval_seconds()
-                    _interval_start_epoch_s = now
-                    _next_call_epoch_s = now + int(_interval_total_seconds or 0)
+                _reset_schedule_after_completion(now)
 
-        # Sleep a bit
+        # Sleep
         for _ in range(5):
             if _stop_requested.is_set():
                 break
             time.sleep(0.2)
-
-        # Progress schedule timer while idle (UI uses it for countdown). We do not advance when a call is active.
 
     logging.info("Dialer thread stopped.")
 
@@ -641,7 +665,10 @@ def api_status():
         interval_start = _interval_start_epoch_s
         interval_total = _interval_total_seconds
 
-    call_in_progress = _get_current_call_sid() is not None
+    # Busy if either pending or active
+    pending = _is_outgoing_pending()
+    active_sid = _get_current_call_sid()
+    call_in_progress = bool(pending or active_sid)
 
     within = _within_active_window(_now_local())
     to = _runtime.to_number
@@ -657,17 +684,14 @@ def api_status():
             attempts_last_day = len(lst)
         can_attempt, wait_if_capped = _can_attempt(now_i, to)
 
-    # Compute countdown only when not in an active call
+    # Pause countdown while pending/active
     seconds_until_next = None
     if not call_in_progress and next_epoch is not None:
         seconds_until_next = max(0, int(next_epoch - now_i))
 
     interval_elapsed = None
     if interval_start is not None and interval_total is not None:
-        if call_in_progress:
-            interval_elapsed = None  # paused
-        else:
-            interval_elapsed = max(0, now_i - interval_start)
+        interval_elapsed = None if call_in_progress else max(0, now_i - interval_start)
 
     payload = {
         "now_epoch": now_i,
@@ -701,7 +725,7 @@ def api_live_transcript():
         transcript = list(_TRANSCRIPTS.get(sid or "", [])) if sid else []
     return jsonify({
         "ok": True,
-        "in_progress": bool(sid),
+        "in_progress": bool(sid or _is_outgoing_pending()),
         "callSid": sid or "",
         "transcript": transcript,
         "media_streams_enabled": bool(_runtime.enable_media_streams),
@@ -756,13 +780,13 @@ def voice_entrypoint():
     call_sid = request.values.get("CallSid", "") or None
     if call_sid:
         _set_current_call_sid(call_sid)
+        _clear_outgoing_pending()
 
     # Optional Media Streams
     if _runtime.enable_media_streams and Start is not None and Stream is not None and _runtime.public_base_url:
         try:
             start = Start()
             ws_base = _runtime.public_base_url.replace("http:", "ws:").replace("https:", "wss:")
-            # Inbound and outbound tracks (Twilio sends base64 PCMU frames)
             start.stream(url=f"{ws_base}/media-in", track="inbound_track")
             start.stream(url=f"{ws_base}/media-out", track="outbound_track")
             vr.append(start)
@@ -797,7 +821,7 @@ def transcribe():
     if VoiceResponse is None:
         return Response("Server missing Twilio TwiML library.", status=500)
     call_sid = request.values.get("CallSid", "") or ""
-    seq = int(request.args.get("seq", "1") or "1")
+    _set_current_call_sid(call_sid or _get_current_call_sid())
     speech_text = (request.values.get("SpeechResult") or "").strip()
     if speech_text:
         _append_transcript(call_sid, "Callee", speech_text, is_final=True)
@@ -811,6 +835,7 @@ def transcribe():
 @app.route("/transcribe-partial", methods=["POST"])
 def transcribe_partial():
     call_sid = request.values.get("CallSid", "") or ""
+    _set_current_call_sid(call_sid or _get_current_call_sid())
     part = (request.values.get("UnstableSpeechResult") or request.values.get("SpeechResult") or "").strip()
     if part:
         _append_transcript(call_sid, "Callee", part, is_final=False)
@@ -833,17 +858,16 @@ def status_callback():
 
     now = int(time.time())
 
-    if call_status in ("in-progress", "answered"):
-        _set_current_call_sid(call_sid)
+    # Mark active as soon as initiated arrives to close race window
+    if call_status in ("initiated", "ringing", "in-progress", "answered"):
+        if call_sid:
+            _set_current_call_sid(call_sid)
+        _clear_outgoing_pending()
 
     if call_status == "completed":
         _set_current_call_sid(None)
-        # Reset schedule to start a fresh countdown after the call
-        with _next_call_epoch_s_lock:
-            interval = _compute_next_interval_seconds()
-            _interval_total_seconds = interval
-            _interval_start_epoch_s = now
-            _next_call_epoch_s = now + int(interval)
+        _clear_outgoing_pending()
+        _reset_schedule_after_completion(now)
 
     return ("", 204)
 
@@ -971,7 +995,7 @@ def api_call_now():
     allowed, wait_s = _can_attempt(now, _runtime.to_number)
     if not allowed:
         return jsonify(ok=False, reason="cap_reached", wait_seconds=wait_s), 429
-    if _get_current_call_sid() is not None:
+    if _is_call_busy():
         return jsonify(ok=False, reason="already_in_progress", message="A call is already in progress."), 409
     _manual_call_requested.set()
     return jsonify(ok=True)
