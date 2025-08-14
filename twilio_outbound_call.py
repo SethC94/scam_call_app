@@ -7,32 +7,34 @@ This build adds:
 - /api/admin/env (GET/POST) for editing non-secret .env values from the Admin UI.
 - Optional ngrok support: If USE_NGROK=true, a tunnel is started and PUBLIC_BASE_URL is set automatically.
 - Larger countdown UI focus and number visibility improvements (via static assets).
+- Clean shutdown on SIGINT/SIGTERM (Command+C).
 """
 
 from __future__ import annotations
 
-import os
-import re
-import sys
-import json
-import time
 import atexit
-import random
-import signal
+import json
 import logging
+import os
+import random
+import re
+import signal
 import threading
-from datetime import datetime
-from typing import Dict, Any, List, Optional, Tuple
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from flask import (
     Flask,
+    Response,
+    jsonify,
+    redirect,
     render_template,
     request,
-    jsonify,
     session,
-    redirect,
     url_for,
-    Response,
 )
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -43,200 +45,49 @@ except Exception:
     bcrypt = None
 
 try:
-    from dotenv import load_dotenv
+    from twilio.rest import Client  # type: ignore
 except Exception:
-    load_dotenv = None
+    Client = None  # type: ignore
 
-# Optional ngrok integration
 try:
+    # Optional ngrok
     from pyngrok import ngrok as ngrok_lib  # type: ignore
 except Exception:
-    ngrok_lib = None
-
-# Twilio SDK
-try:
-    from twilio.rest import Client
-    from twilio.base.exceptions import TwilioRestException
-except Exception:
-    Client = None
-    TwilioRestException = Exception  # type: ignore
-
+    ngrok_lib = None  # type: ignore
 
 # -----------------------------------------------------------------------------
-# Environment and configuration
+# Flask app
 # -----------------------------------------------------------------------------
 
-DOTENV_PATH = os.environ.get("DOTENV_PATH") or ".env"
-if load_dotenv:
-    load_dotenv(DOTENV_PATH)
-
-# Application
 app = Flask(__name__, static_folder="static", template_folder="templates")
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1)
-app.secret_key = os.environ.get("FLASK_SECRET", "dev_insecure_change_me")
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1)  # type: ignore
 
+# NOTE: configure a secure, stable secret in production via environment variable
+app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
+
+# -----------------------------------------------------------------------------
 # Logging
+# -----------------------------------------------------------------------------
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-# Globals managed at runtime
-_runtime_lock = threading.Lock()
-_manual_call_requested = threading.Event()
-_stop_requested = threading.Event()
-
-# One-shot greeting phrase (next call only)
-_ONE_SHOT_GREETING = None
-_ONE_SHOT_GREETING_LOCK = threading.Lock()
-
-# Attempt tracking per-destination
-_attempts_lock = threading.Lock()
-_dest_attempts: Dict[str, List[float]] = {}  # to_number -> epoch list
-
-# Next randomized interval bookkeeping (for UI status)
-_next_call_epoch_s_lock = threading.Lock()
-_next_call_epoch_s: Optional[int] = None
-_interval_start_epoch_s: Optional[int] = None
-_interval_total_seconds: Optional[int] = None
-
-# Twilio client
-_twilio_client: Optional[Client] = None
-
-# Ngrok tunnel state
-_active_tunnel_url: Optional[str] = None
-
-
 # -----------------------------------------------------------------------------
-# Configuration handling
+# Helpers: parsing, time, dotenv
 # -----------------------------------------------------------------------------
 
-def _load_dotenv_pairs(path: str) -> List[Tuple[str, str]]:
-    pairs: List[Tuple[str, str]] = []
-    if not os.path.exists(path):
-        return pairs
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for raw in f:
-                line = raw.rstrip("\n")
-                if not line or line.lstrip().startswith("#"):
-                    continue
-                m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$", line)
-                if not m:
-                    continue
-                key = m.group(1)
-                val = m.group(2)
-                if len(val) >= 2 and ((val[0] == val[-1] == '"') or (val[0] == val[-1] == "'")):
-                    val = val[1:-1]
-                pairs.append((key, val))
-    except Exception as e:
-        logging.error("Failed to read .env pairs: %s", e)
-    return pairs
-
-
-def _load_dotenv_lines(path: str) -> List[str]:
-    if not os.path.exists(path):
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read().splitlines()
-    except Exception:
-        return []
-
-
-def _write_dotenv_lines(path: str, lines: List[str]) -> None:
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + ("\n" if lines and not lines[-1].endswith("\n") else ""))
-    os.replace(tmp, path)
-
-
-def _sanitize_env_value(v: str) -> str:
-    v = v.replace("\r", "").replace("\n", "")
-    if re.search(r"\s|#|\"|'", v):
-        vv = v.replace('"', '\\"')
-        return f"\"{vv}\""
-    return v
-
-
-def _secrets_denylist() -> List[re.Pattern]:
-    patterns = [
-        re.compile(r".*TOKEN.*", re.I),
-        re.compile(r".*SECRET.*", re.I),
-        re.compile(r".*PASSWORD.*", re.I),
-        re.compile(r".*AUTH.*", re.I),
-        re.compile(r".*ACCOUNT_SID.*", re.I),
-        re.compile(r".*API[_-]?KEY.*", re.I),
-        re.compile(r".*PRIVATE[_-]?KEY.*", re.I),
-    ]
-    for s in ["NGROK_AUTHTOKEN", "FLASK_SECRET", "ADMIN_PASSWORD_HASH"]:
-        patterns.append(re.compile(rf"^{re.escape(s)}$", re.I))
-    return patterns
-
-
-def _is_secret_key(name: str) -> bool:
-    for pat in _secrets_denylist():
-        if pat.match(name):
-            return True
-    return False
-
-
-def _current_env_editable_pairs() -> List[Tuple[str, str]]:
-    pairs = _load_dotenv_pairs(DOTENV_PATH)
-    editable = []
-    for k, v in pairs:
-        if _is_secret_key(k):
-            continue
-        if k.upper() in {"ADMIN_USER"}:
-            continue
-        editable.append((k, v))
-    editable.sort(key=lambda kv: kv[0])
-    return editable
-
-
-def _apply_env_updates(updates: Dict[str, str]) -> None:
-    lines = _load_dotenv_lines(DOTENV_PATH)
-    if not lines:
-        lines = []
-    existing_keys = {}
-    for idx, raw in enumerate(lines):
-        m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$", raw)
-        if m:
-            existing_keys[m.group(1)] = idx
-
-    for key, new_val in updates.items():
-        if _is_secret_key(key) or key.upper() == "ADMIN_USER":
-            continue
-        sval = _sanitize_env_value(str(new_val))
-        if key in existing_keys:
-            idx = existing_keys[key]
-            prefix_ws = ""
-            m = re.match(r"^(\s*)", lines[idx])
-            if m:
-                prefix_ws = m.group(1)
-            lines[idx] = f"{prefix_ws}{key}={sval}"
-        else:
-            lines.append(f"{key}={sval}")
-        os.environ[key] = str(new_val)
-
-    _write_dotenv_lines(DOTENV_PATH, lines)
-    _reload_runtime_from_env()
-
-
-# -----------------------------------------------------------------------------
-# Runtime config values and helpers
-# -----------------------------------------------------------------------------
+TRUE_SET = {"1", "true", "yes", "on", "y", "t"}
 
 def _parse_bool(s: Optional[str], default: bool = False) -> bool:
     if s is None:
         return default
-    return s.strip().lower() in {"1", "true", "yes", "on"}
+    return str(s).strip().lower() in TRUE_SET
 
 
 def _parse_int(s: Optional[str], default: int) -> int:
-    if s is None:
-        return default
     try:
         return int(str(s).strip())
     except Exception:
@@ -246,115 +97,375 @@ def _parse_int(s: Optional[str], default: int) -> int:
 def _parse_csv(s: Optional[str]) -> List[str]:
     if not s:
         return []
-    return [x.strip() for x in s.split(",") if x.strip()]
-
-
-class Runtime:
-    def __init__(self) -> None:
-        # Numbers (E.164)
-        self.to_number = os.environ.get("TO_NUMBER", "").strip()
-        self.from_number = os.environ.get("FROM_NUMBER", "").strip()
-        self.from_numbers = _parse_csv(os.environ.get("FROM_NUMBERS"))
-
-        # Schedule and attempt limits
-        self.active_hours_local = os.environ.get("ACTIVE_HOURS_LOCAL", "09:00-18:00").strip()
-        self.active_days = [d.strip().title() for d in _parse_csv(os.environ.get("ACTIVE_DAYS") or "Mon,Tue,Wed,Thu,Fri")]
-        self.min_interval_seconds = max(30, _parse_int(os.environ.get("MIN_INTERVAL_SECONDS"), 120))
-        self.max_interval_seconds = max(self.min_interval_seconds, _parse_int(os.environ.get("MAX_INTERVAL_SECONDS"), 420))
-        self.hourly_max_attempts = max(1, _parse_int(os.environ.get("HOURLY_MAX_ATTEMPTS_PER_DEST"), 3))
-        self.daily_max_attempts = max(1, _parse_int(os.environ.get("DAILY_MAX_ATTEMPTS_PER_DEST"), 12))
-        self.backoff_strategy = (os.environ.get("BACKOFF_STRATEGY", "none") or "none").strip().lower()
-
-        # Twilio and webhooks
-        self.public_base_url = os.environ.get("PUBLIC_BASE_URL", "").strip()
-        self.use_ngrok = _parse_bool(os.environ.get("USE_NGROK"), False)
-
-        # Content
-        self.company_name = os.environ.get("COMPANY_NAME", "Your Company").strip() or "Your Company"
-        self.topic = os.environ.get("TOPIC", "availability").strip() or "availability"
-        self.tts_voice = os.environ.get("TTS_VOICE", "man").strip() or "man"
-        self.tts_language = os.environ.get("TTS_LANGUAGE", "en-US").strip() or "en-US"
-
-        # Admin defaults
-        self.admin_user = os.environ.get("ADMIN_USER") or None
-        self.admin_password_hash = os.environ.get("ADMIN_PASSWORD_HASH") or None
-
-        # AMD and other
-        self.amd_mode = (os.environ.get("AMD_MODE", "off") or "off").strip().lower()
-        self.amd_timeout_seconds = max(3, _parse_int(os.environ.get("AMD_TIMEOUT_SECONDS"), 8))
-        self.machine_behavior = (os.environ.get("MACHINE_BEHAVIOR", "hangup") or "hangup").strip().lower()
-
-        self.callee_silence_hangup_seconds = max(5, min(60, _parse_int(os.environ.get("CALLEE_SILENCE_HANGUP_SECONDS"), 10)))
-
-
-_runtime = Runtime()
-
-
-def _reload_runtime_from_env() -> None:
-    global _runtime
-    with _runtime_lock:
-        _runtime = Runtime()
-        logging.info("Runtime configuration refreshed from environment.")
-
-
-def _normalize_dash(s: str) -> str:
-    return s.replace("\u2013", "-").replace("\u2014", "-")
+    return [p.strip() for p in str(s).split(",") if p.strip()]
 
 
 def _now_local() -> datetime:
-    return datetime.now()
-
-
-def _parse_active_window(active_str: str) -> Tuple[int, int]:
+    # Present local time with timezone awareness if available
     try:
-        active_str = _normalize_dash(active_str)
-        s, e = active_str.split("-")
-        hs, ms = [int(x) for x in s.strip().split(":")]
-        he, me = [int(x) for x in e.strip().split(":")]
-        return hs * 60 + ms, he * 60 + me
+        return datetime.now().astimezone()
     except Exception:
-        return 9 * 60, 18 * 60
+        return datetime.now()
 
 
-def _within_active_window(now_dt: datetime) -> bool:
-    day = now_dt.strftime("%a")
-    if day not in _runtime.active_days:
+def _load_dotenv_pairs(path: str) -> List[Tuple[str, str]]:
+    """
+    Parse key=value pairs from a .env file without mutating os.environ.
+    Keeps simple quoted values intact (single/double quotes).
+    Ignores comments and blank lines.
+    """
+    pairs: List[Tuple[str, str]] = []
+    p = Path(path)
+    if not p.exists():
+        return pairs
+    try:
+        for raw in p.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", line)
+            if not m:
+                continue
+            key = m.group(1)
+            val = m.group(2)
+            if len(val) >= 2 and ((val[0] == val[-1] == '"') or (val[0] == val[-1] == "'")):
+                val = val[1:-1]
+            pairs.append((key, val))
+    except Exception as e:
+        logging.error("Failed to read .env pairs: %s", e)
+    return pairs
+
+
+def _load_dotenv_lines(path: str) -> List[str]:
+    """
+    Return raw lines for .env, preserving order and comments.
+    If file missing, returns empty list.
+    """
+    p = Path(path)
+    if not p.exists():
+        return []
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            return f.readlines()
+    except Exception:
+        return []
+
+
+def _overlay_env_from_dotenv(path: str) -> None:
+    """
+    Load .env into process environment if a key is not already set.
+    This is safe at startup to reflect a local .env without requiring python-dotenv.
+    """
+    for k, v in _load_dotenv_pairs(path):
+        if k not in os.environ:
+            os.environ[k] = v
+
+
+# Load .env values at startup for convenience (does not overwrite existing process env)
+_overlay_env_from_dotenv(".env")
+
+# -----------------------------------------------------------------------------
+# Runtime configuration
+# -----------------------------------------------------------------------------
+
+@dataclass
+class RuntimeConfig:
+    # Phone numbers
+    to_number: str = ""
+    from_number: str = ""
+    from_numbers: List[str] = field(default_factory=list)
+
+    # Pacing and schedule
+    active_hours_local: str = "09:00-18:00"         # e.g., "09:00-18:00"
+    active_days: List[str] = field(default_factory=lambda: ["Mon", "Tue", "Wed", "Thu", "Fri"])
+    min_interval_seconds: int = 120
+    max_interval_seconds: int = 420
+    hourly_max_attempts: int = 3
+    daily_max_attempts: int = 20
+
+    # Admin
+    admin_user: Optional[str] = None
+    admin_password_hash: Optional[str] = None  # bcrypt hash string if used
+
+    # UI / misc
+    rotate_prompts: bool = True
+    rotate_prompts_strategy: str = "random"
+    tts_voice: str = "man"
+    tts_language: str = "en-US"
+    recording_mode: str = "off"  # off|mono|dual|ask
+    recording_jurisdiction_mode: str = "disable_in_two_party"
+
+    # Networking
+    public_base_url: Optional[str] = None
+    use_ngrok: bool = False
+
+    # Flask/server
+    flask_host: str = "0.0.0.0"
+    flask_port: int = 8080
+    flask_debug: bool = False
+
+
+_runtime = RuntimeConfig()
+
+# Attempt tracking per destination number
+_attempts_lock = threading.Lock()
+_dest_attempts: Dict[str, List[float]] = {}  # to_number -> timestamps (epoch seconds)
+
+# Next randomized interval bookkeeping (for UI status)
+_next_call_epoch_s_lock = threading.Lock()
+_next_call_epoch_s: Optional[int] = None
+_interval_start_epoch_s: Optional[int] = None
+_interval_total_seconds: Optional[int] = None
+
+# Twilio client (lazy)
+_twilio_client: Optional[Client] = None
+
+# Ngrok
+_active_tunnel_url: Optional[str] = None
+
+# Lifecycle flags
+_manual_call_requested = threading.Event()
+_stop_requested = threading.Event()
+
+# One-shot greeting (next call only)
+_ONE_SHOT_GREETING: Optional[str] = None
+_ONE_SHOT_GREETING_LOCK = threading.Lock()
+
+# -----------------------------------------------------------------------------
+# Config loading / refresh
+# -----------------------------------------------------------------------------
+
+def _normalize_day_name(s: str) -> Optional[str]:
+    if not s:
+        return None
+    t = s.strip().lower()
+    mapping = {
+        "mon": "Mon", "monday": "Mon",
+        "tue": "Tue", "tues": "Tue", "tuesday": "Tue",
+        "wed": "Wed", "weds": "Wed", "wednesday": "Wed",
+        "thu": "Thu", "thur": "Thu", "thurs": "Thu", "thursday": "Thu",
+        "fri": "Fri", "friday": "Fri",
+        "sat": "Sat", "saturday": "Sat",
+        "sun": "Sun", "sunday": "Sun",
+    }
+    return mapping.get(t)
+
+
+def _load_runtime_from_env() -> None:
+    _runtime.to_number = (os.environ.get("TO_NUMBER") or "").strip()
+    _runtime.from_number = (os.environ.get("FROM_NUMBER") or "").strip()
+    _runtime.from_numbers = _parse_csv(os.environ.get("FROM_NUMBERS"))
+
+    _runtime.active_hours_local = (os.environ.get("ACTIVE_HOURS_LOCAL") or "09:00-18:00").strip()
+    days = _parse_csv(os.environ.get("ACTIVE_DAYS") or "Mon,Tue,Wed,Thu,Fri")
+    _runtime.active_days = [d for d in ([_normalize_day_name(x) for x in days]) if d]
+
+    _runtime.min_interval_seconds = max(30, _parse_int(os.environ.get("MIN_INTERVAL_SECONDS"), 120))
+    _runtime.max_interval_seconds = max(
+        _runtime.min_interval_seconds,
+        _parse_int(os.environ.get("MAX_INTERVAL_SECONDS"), 420),
+    )
+    _runtime.hourly_max_attempts = max(1, _parse_int(os.environ.get("HOURLY_MAX_ATTEMPTS_PER_DEST"), 3))
+    _runtime.daily_max_attempts = max(_runtime.hourly_max_attempts, _parse_int(os.environ.get("DAILY_MAX_ATTEMPTS_PER_DEST"), 20))
+
+    _runtime.rotate_prompts = _parse_bool(os.environ.get("ROTATE_PROMPTS"), True)
+    _runtime.rotate_prompts_strategy = (os.environ.get("ROTATE_PROMPTS_STRATEGY") or "random").strip().lower()
+
+    _runtime.tts_voice = (os.environ.get("TTS_VOICE") or "man").strip()
+    _runtime.tts_language = (os.environ.get("TTS_LANGUAGE") or "en-US").strip()
+
+    _runtime.recording_mode = (os.environ.get("RECORDING_MODE") or "off").strip().lower()
+    _runtime.recording_jurisdiction_mode = (os.environ.get("RECORDING_JURISDICTION_MODE") or "disable_in_two_party").strip().lower()
+
+    _runtime.admin_user = (os.environ.get("ADMIN_USER") or "").strip() or None
+    _runtime.admin_password_hash = (os.environ.get("ADMIN_PASSWORD_HASH") or "").strip() or None
+
+    _runtime.public_base_url = (os.environ.get("PUBLIC_BASE_URL") or "").strip() or None
+    _runtime.use_ngrok = _parse_bool(os.environ.get("USE_NGROK"), False)
+
+    _runtime.flask_host = (os.environ.get("FLASK_HOST") or "0.0.0.0").strip() or "0.0.0.0"
+    _runtime.flask_port = _parse_int(os.environ.get("FLASK_PORT"), 8080)
+    _runtime.flask_debug = _parse_bool(os.environ.get("FLASK_DEBUG"), False)
+
+# Initial load
+_load_runtime_from_env()
+
+# -----------------------------------------------------------------------------
+# Editable env: safe keys and persistence
+# -----------------------------------------------------------------------------
+
+_EDITABLE_ENV_KEYS = [
+    # Phone numbers and pools
+    "TO_NUMBER",
+    "FROM_NUMBER",
+    "FROM_NUMBERS",
+
+    # Scheduling and pacing
+    "ACTIVE_HOURS_LOCAL",
+    "ACTIVE_DAYS",
+    "MIN_INTERVAL_SECONDS",
+    "MAX_INTERVAL_SECONDS",
+    "HOURLY_MAX_ATTEMPTS_PER_DEST",
+    "DAILY_MAX_ATTEMPTS_PER_DEST",
+
+    # Recording and voice settings (non-secret toggles)
+    "RECORDING_MODE",
+    "RECORDING_JURISDICTION_MODE",
+    "TTS_VOICE",
+    "TTS_LANGUAGE",
+    "ROTATE_PROMPTS",
+    "ROTATE_PROMPTS_STRATEGY",
+
+    # General non-secrets
+    "COMPANY_NAME",
+    "TOPIC",
+    "ALLOWED_COUNTRY_CODES",
+    "CALLEE_SILENCE_HANGUP_SECONDS",
+
+    # Optional dev flags (non-secret)
+    "USE_NGROK",
+    "NONINTERACTIVE",
+    "LOG_COLOR",
+    "FLASK_HOST",
+    "FLASK_PORT",
+    "FLASK_DEBUG",
+    "PUBLIC_BASE_URL",
+]
+
+_SECRET_ENV_KEYS = {
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN",
+    "ADMIN_PASSWORD_HASH",
+    "ADMIN_USER",  # not a secret per se, but do not expose/edit via UI here
+    "FLASK_SECRET",
+}
+
+def _current_env_editable_pairs() -> List[Tuple[str, str]]:
+    """
+    Combine process environment and .env to represent current editable values.
+    Order follows _EDITABLE_ENV_KEYS.
+    """
+    effective: Dict[str, str] = {}
+    for k in _EDITABLE_ENV_KEYS:
+        effective[k] = (os.environ.get(k) or "").strip()
+
+    # Overlay .env file values if present to reflect file state
+    try:
+        env_path = Path(".env")
+        if env_path.exists():
+            for k, v in _load_dotenv_pairs(str(env_path)):
+                if k in _EDITABLE_ENV_KEYS:
+                    effective[k] = (v or "").strip()
+    except Exception:
+        pass
+
+    return [(k, effective.get(k, "")) for k in _EDITABLE_ENV_KEYS]
+
+
+def _write_env_updates_preserving_comments(updates: Dict[str, str]) -> None:
+    """
+    Persist updates for editable keys into .env, preserving comments and unrelated lines.
+    """
+    env_path = Path(".env")
+    lines = _load_dotenv_lines(str(env_path))
+    key_to_idx: Dict[str, int] = {}
+
+    for idx, raw in enumerate(lines):
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        eq = s.find("=")
+        if eq <= 0:
+            continue
+        k = s[:eq].strip()
+        if k in _EDITABLE_ENV_KEYS:
+            key_to_idx[k] = idx
+
+    content = list(lines)
+    for k, v in updates.items():
+        if k not in _EDITABLE_ENV_KEYS:
+            continue
+        safe_v = "" if v is None else str(v)
+        new_line = f"{k}={safe_v}\n"
+        if k in key_to_idx:
+            content[key_to_idx[k]] = new_line
+        else:
+            if content and not content[-1].endswith("\n"):
+                content[-1] = content[-1] + "\n"
+            content.append(new_line)
+
+    tmp = env_path.with_suffix(".tmp")
+    bak = env_path.with_suffix(".bak")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.writelines(content)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        if env_path.exists():
+            if bak.exists():
+                try:
+                    bak.unlink()
+                except Exception:
+                    pass
+            env_path.replace(bak)
+    except Exception:
+        pass
+    os.replace(tmp, env_path)
+
+
+def _apply_env_updates(updates: Dict[str, str]) -> None:
+    """
+    Apply updates: write to .env, update process env for current process, and refresh runtime config.
+    """
+    # Persist first
+    _write_env_updates_preserving_comments(updates)
+
+    # Update current process environment
+    for k, v in updates.items():
+        if k in _EDITABLE_ENV_KEYS and k not in _SECRET_ENV_KEYS:
+            os.environ[k] = "" if v is None else str(v)
+
+    # Refresh runtime view
+    _load_runtime_from_env()
+
+
+# -----------------------------------------------------------------------------
+# Attempt tracking and active window logic
+# -----------------------------------------------------------------------------
+
+def _within_active_window(now_local: datetime) -> bool:
+    """
+    Determine if current local time is within configured active window (hours and days).
+    active_hours_local: "HH:MM-HH:MM" in local time.
+    active_days: List of day names ["Mon", "Tue", ...].
+    """
+    try:
+        start_str, end_str = (_runtime.active_hours_local or "09:00-18:00").split("-", 1)
+        sh, sm = [int(x) for x in start_str.split(":")]
+        eh, em = [int(x) for x in end_str.split(":")]
+    except Exception:
+        sh, sm, eh, em = 9, 0, 18, 0
+
+    wd_map = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    today = wd_map[now_local.weekday()]
+    if _runtime.active_days and today not in _runtime.active_days:
         return False
-    start_min, end_min = _parse_active_window(_runtime.active_hours_local)
-    mins = now_dt.hour * 60 + now_dt.minute
-    if start_min <= end_min:
-        return start_min <= mins < end_min
-    return mins >= start_min or mins < end_min
+
+    t_minutes = now_local.hour * 60 + now_local.minute
+    start_m = sh * 60 + sm
+    end_m = eh * 60 + em
+    if start_m <= end_m:
+        return start_m <= t_minutes <= end_m
+    # Window wraps midnight
+    return t_minutes >= start_m or t_minutes <= end_m
 
 
-def _prune_attempts(now_ts: float, to_number: str) -> None:
-    with _attempts_lock:
-        prev = _dest_attempts.get(to_number, [])
-        cutoff = now_ts - 86400
-        _dest_attempts[to_number] = [t for t in prev if t >= cutoff]
-
-
-def _can_attempt(now_ts: float, to_number: str) -> Tuple[bool, int]:
-    _prune_attempts(now_ts, to_number)
+def _prune_attempts(now_ts: int, to_number: str) -> None:
     with _attempts_lock:
         lst = _dest_attempts.get(to_number, [])
-        last_hour = [t for t in lst if t >= now_ts - 3600]
-        last_day = lst
-        hourly_ok = len(last_hour) < _runtime.hourly_max_attempts
-        daily_ok = len(last_day) < _runtime.daily_max_attempts
-
-        wait_hour = 0
-        wait_day = 0
-        if not hourly_ok and last_hour:
-            next_allowed_hour = min(last_hour) + 3600
-            wait_hour = max(0, int(next_allowed_hour - now_ts))
-        if not daily_ok and last_day:
-            next_allowed_day = min(last_day) + 86400
-            wait_day = max(0, int(next_allowed_day - now_ts))
-
-        allowed = hourly_ok and daily_ok
-        wait_total = max(wait_hour, wait_day)
-        return allowed, wait_total
+        # Keep 24h window
+        cutoff = now_ts - 24 * 3600
+        _dest_attempts[to_number] = [t for t in lst if t >= cutoff]
 
 
 def _note_attempt(now_ts: float, to_number: str) -> None:
@@ -362,14 +473,27 @@ def _note_attempt(now_ts: float, to_number: str) -> None:
         _dest_attempts.setdefault(to_number, []).append(now_ts)
 
 
-def _choose_from_number() -> Optional[str]:
-    if _runtime.from_numbers:
-        return random.choice(_runtime.from_numbers)
-    return _runtime.from_number or None
+def _can_attempt(now_ts: int, to_number: str) -> Tuple[bool, int]:
+    """
+    Return (allowed, wait_seconds_if_capped).
+    Enforces hourly and daily limits for the destination.
+    """
+    _prune_attempts(now_ts, to_number)
+    with _attempts_lock:
+        lst = _dest_attempts.get(to_number, [])
+        last_hour = [t for t in lst if t >= now_ts - 3600]
+        if len(last_hour) >= _runtime.hourly_max_attempts:
+            # Approximate wait until the oldest of last hour window expires
+            oldest = min(last_hour) if last_hour else now_ts
+            return False, max(1, (oldest + 3600) - now_ts)
+        if len(lst) >= _runtime.daily_max_attempts:
+            # Wait until next day (simplified)
+            return False, 3600  # 1 hour conservative back-off
+    return True, 0
 
 
 # -----------------------------------------------------------------------------
-# Twilio integration
+# Twilio handling (minimal; integrate as needed for outbound placement)
 # -----------------------------------------------------------------------------
 
 def _ensure_twilio_client() -> Optional[Client]:
@@ -379,133 +503,120 @@ def _ensure_twilio_client() -> Optional[Client]:
     if Client is None:
         logging.error("Twilio SDK not available. Install with: pip install twilio")
         return None
-
-    account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
-    auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
-    if not account_sid or not auth_token:
+    sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    tok = os.environ.get("TWILIO_AUTH_TOKEN")
+    if not sid or not tok:
         logging.error("Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN in environment.")
         return None
-    _twilio_client = Client(account_sid, auth_token)
+    _twilio_client = Client(sid, tok)
     return _twilio_client
 
 
-def initiate_outbound_call() -> Tuple[bool, str]:
-    client = _ensure_twilio_client()
-    if client is None:
-        return False, "Twilio client is not configured."
-
-    if not _runtime.public_base_url:
-        return False, "PUBLIC_BASE_URL is not configured."
-
-    to_number = _runtime.to_number
-    if not to_number:
-        return False, "TO_NUMBER is not configured."
-
-    from_number = _choose_from_number()
-    if not from_number:
-        return False, "No FROM_NUMBER or FROM_NUMBERS configured."
-
-    answer_url = f"{_runtime.public_base_url.rstrip('/')}/twilio/answer"
-    try:
-        call = client.calls.create(
-            to=to_number,
-            from_=from_number,
-            url=answer_url,
-            machine_detection="DetectMessageEnd" if _runtime.amd_mode in {"detect", "detect_hangup", "detect_message"} else None,
-            time_limit=300,
-        )
-        _note_attempt(time.time(), to_number)
-        logging.info("Outbound call created. CallSid=%s to=%s from=%s", getattr(call, "sid", "?"), to_number, from_number)
-        return True, "Call initiated."
-    except TwilioRestException as e:
-        logging.error("Twilio error while initiating call: %s", e)
-        return False, f"Twilio error: {e}"
-    except Exception as e:
-        logging.error("Error while initiating call: %s", e)
-        return False, f"Error: {e}"
+def _choose_from_number() -> Optional[str]:
+    if _runtime.from_numbers:
+        return random.choice(_runtime.from_numbers)
+    return _runtime.from_number or None
 
 
 # -----------------------------------------------------------------------------
-# Background scheduler
+# Background dialer (simplified loop honoring pacing and stop events)
 # -----------------------------------------------------------------------------
 
-def _rand_interval_seconds() -> int:
-    lo = _runtime.min_interval_seconds
-    hi = _runtime.max_interval_seconds
-    return lo if hi <= lo else random.randint(lo, hi)
-
-
-def _set_next_call_epoch(delta_s: int) -> None:
-    global _next_call_epoch_s, _interval_total_seconds, _interval_start_epoch_s
-    now_i = int(time.time())
-    with _next_call_epoch_s_lock:
-        _next_call_epoch_s = now_i + max(0, int(delta_s))
-        _interval_total_seconds = max(0, int(delta_s))
-        _interval_start_epoch_s = now_i
+def _compute_next_interval_seconds() -> int:
+    lo = max(30, int(_runtime.min_interval_seconds))
+    hi = max(lo, int(_runtime.max_interval_seconds))
+    if lo == hi:
+        return lo
+    return random.randint(lo, hi)
 
 
 def _dialer_loop() -> None:
-    logging.info("Dialer loop started.")
-    delay_s = _rand_interval_seconds()
-    _set_next_call_epoch(delay_s)
-
+    global _next_call_epoch_s, _interval_start_epoch_s, _interval_total_seconds
+    logging.info("Dialer thread started.")
     while not _stop_requested.is_set():
-        if _manual_call_requested.wait(timeout=1.0):
-            _manual_call_requested.clear()
-            now = _now_local()
-            if not _within_active_window(now):
-                logging.info("Call now rejected: outside active window.")
-            else:
-                allowed, wait_s = _can_attempt(time.time(), _runtime.to_number)
-                if not allowed:
-                    logging.info("Call now rejected: cap reached, wait %ss.", wait_s)
-                else:
-                    ok, msg = initiate_outbound_call()
-                    logging.info("Call now attempt: %s", msg)
-            delay_s = _rand_interval_seconds()
-            _set_next_call_epoch(delay_s)
-            continue
+        now = int(time.time())
 
-        now_ts = int(time.time())
+        # Determine next planned attempt time (interval-based)
         with _next_call_epoch_s_lock:
-            due = _next_call_epoch_s is not None and now_ts >= _next_call_epoch_s
+            if _next_call_epoch_s is None:
+                # Initialize an interval starting now
+                _interval_total_seconds = _compute_next_interval_seconds()
+                _interval_start_epoch_s = now
+                _next_call_epoch_s = now + int(_interval_total_seconds or 0)
 
-        if not due:
-            continue
+        # Manual trigger: attempt immediately if allowed
+        if _manual_call_requested.is_set():
+            _manual_call_requested.clear()
 
-        now_local = _now_local()
-        if not _within_active_window(now_local):
-            delay_s = 60
-            _set_next_call_epoch(delay_s)
-            continue
+            if not _runtime.to_number:
+                logging.info("TO_NUMBER not configured; skipping manual attempt.")
+            else:
+                can, wait_s = _can_attempt(now, _runtime.to_number)
+                if not can:
+                    logging.info("Attempt capped; wait %ss.", wait_s)
+                elif not _within_active_window(_now_local()):
+                    logging.info("Outside active window; attempt suppressed.")
+                else:
+                    # Place call via Twilio (minimal; extend as needed)
+                    client = _ensure_twilio_client()
+                    from_n = _choose_from_number()
+                    if client and from_n:
+                        try:
+                            # In a full build, provide proper TwiML URLs
+                            public_url = _runtime.public_base_url or ""
+                            # Fallback simple say TwiML if no PUBLIC_BASE_URL
+                            if not public_url:
+                                # This is a basic TwiML bin served by Twilio if configured; otherwise, skip placement
+                                logging.info("PUBLIC_BASE_URL not configured; call not placed to avoid Twilio callback failures.")
+                            else:
+                                call = client.calls.create(
+                                    to=_runtime.to_number,
+                                    from_=from_n,
+                                    url=f"{public_url}/voice",
+                                    status_callback=f"{public_url}/status",
+                                    status_callback_event=["initiated", "ringing", "answered", "completed"],
+                                    status_callback_method="POST",
+                                )
+                                logging.info("Placed call: %s", getattr(call, "sid", "<sid>"))
+                                _note_attempt(time.time(), _runtime.to_number)
+                        except Exception as e:
+                            logging.error("Twilio call placement failed: %s", e)
+                    else:
+                        logging.info("Twilio not configured or no FROM number; cannot place call.")
 
-        allowed, wait_s = _can_attempt(time.time(), _runtime.to_number)
-        if not allowed:
-            delay_s = max(wait_s, 60)
-            _set_next_call_epoch(delay_s)
-            continue
+        # Wait a short step with responsiveness to stop signal
+        for _ in range(5):
+            if _stop_requested.is_set():
+                break
+            time.sleep(0.2)
 
-        ok, msg = initiate_outbound_call()
-        logging.info("Scheduled attempt: %s", msg)
+        # Maintain rolling interval timing for UI
+        now = int(time.time())
+        with _next_call_epoch_s_lock:
+            if _next_call_epoch_s is not None and now >= _next_call_epoch_s:
+                # Start a new interval
+                _interval_total_seconds = _compute_next_interval_seconds()
+                _interval_start_epoch_s = now
+                _next_call_epoch_s = now + int(_interval_total_seconds or 0)
 
-        delay_s = _rand_interval_seconds()
-        _set_next_call_epoch(delay_s)
-
-    logging.info("Dialer loop stopped.")
+    logging.info("Dialer thread stopped.")
 
 
-_dialer_thread = threading.Thread(target=_dialer_loop, name="dialer", daemon=True)
-
+_dialer_thread = threading.Thread(target=_dialer_loop, name="dialer-thread", daemon=True)
 
 # -----------------------------------------------------------------------------
 # Admin authentication helpers
 # -----------------------------------------------------------------------------
 
 def _admin_defaults() -> Tuple[str, Optional[str], bool]:
+    """
+    Returns (username, bcrypt_hash_or_None, uses_hash_bool)
+    """
     env_user = (_runtime.admin_user or "").strip() if _runtime.admin_user else None
     env_hash = (_runtime.admin_password_hash or "").strip() if _runtime.admin_password_hash else None
     if env_user and env_hash and bcrypt is not None:
         return env_user, env_hash, True
+    # Default development credentials (do not use in production)
     return "bootycall", None, False
 
 
@@ -517,7 +628,6 @@ def _require_admin_for_api() -> Optional[Response]:
     if not _admin_authenticated():
         return Response(json.dumps({"error": "unauthorized"}), status=401, mimetype="application/json")
     return None
-
 
 # -----------------------------------------------------------------------------
 # Flask routes: UI and API
@@ -583,11 +693,16 @@ def api_admin_env_post():
         return resp
     try:
         data = request.get_json(force=True, silent=False) or {}
-        updates = data.get("updates") or {}
-        if not isinstance(updates, dict):
+        updates_raw = data.get("updates") or {}
+        if not isinstance(updates_raw, dict):
             return Response("Invalid payload.", status=400)
-        # Limit to string-like values
-        clean_updates = {str(k): "" if v is None else str(v) for k, v in updates.items()}
+        # Normalize and filter
+        clean_updates: Dict[str, str] = {}
+        for k, v in updates_raw.items():
+            if k in _SECRET_ENV_KEYS:
+                continue
+            if k in _EDITABLE_ENV_KEYS:
+                clean_updates[str(k)] = "" if v is None else str(v)
         _apply_env_updates(clean_updates)
         return jsonify({"ok": True})
     except Exception as e:
@@ -597,11 +712,15 @@ def api_admin_env_post():
 
 @app.route("/api/call-now", methods=["POST"])
 def api_call_now():
-    now_local = _now_local()
-    if not _within_active_window(now_local):
+    # Enforce active window and caps at request time
+    if not _within_active_window(_now_local()):
         return jsonify(ok=False, reason="outside_active_window", message="Outside active calling window."), 200
 
-    allowed, wait_s = _can_attempt(time.time(), _runtime.to_number)
+    if not _runtime.to_number:
+        return jsonify(ok=False, reason="missing_destination", message="TO_NUMBER is not configured."), 400
+
+    now = int(time.time())
+    allowed, wait_s = _can_attempt(now, _runtime.to_number)
     if not allowed:
         return jsonify(ok=False, reason="cap_reached", wait_seconds=wait_s), 429
 
@@ -680,54 +799,8 @@ def api_status():
     }
     return jsonify(payload)
 
-
 # -----------------------------------------------------------------------------
-# Twilio webhook routes
-# -----------------------------------------------------------------------------
-
-def _xml_escape(s: str) -> str:
-    return (
-        s.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-        .replace("'", "&apos;")
-    )
-
-
-@app.route("/twilio/answer", methods=["POST", "GET"])
-def twilio_answer():
-    phrase = None
-    global _ONE_SHOT_GREETING
-    with _ONE_SHOT_GREETING_LOCK:
-        if _ONE_SHOT_GREETING:
-            phrase = _ONE_SHOT_GREETING
-            _ONE_SHOT_GREETING = None
-
-    greeting_lines: List[str] = []
-    if phrase:
-        greeting_lines.append(phrase)
-    else:
-        greeting_lines.append(
-            f"Hello, this is { _xml_escape(_runtime.company_name) }. I am calling about { _xml_escape(_runtime.topic) }."
-        )
-
-    say_text = " ".join(greeting_lines)
-    voice = _runtime.tts_voice or "man"
-    lang = _runtime.tts_language or "en-US"
-
-    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="{_xml_escape(voice)}" language="{_xml_escape(lang)}">{_xml_escape(say_text)}</Say>
-  <Pause length="1"/>
-  <Hangup/>
-</Response>
-"""
-    return Response(xml, status=200, mimetype="text/xml")
-
-
-# -----------------------------------------------------------------------------
-# Ngrok support
+# Ngrok management (optional)
 # -----------------------------------------------------------------------------
 
 def _start_ngrok_if_enabled() -> None:
@@ -735,34 +808,19 @@ def _start_ngrok_if_enabled() -> None:
     if not _runtime.use_ngrok:
         return
     if ngrok_lib is None:
-        logging.error("USE_NGROK=true but pyngrok is not installed. Install with: pip install pyngrok")
+        logging.warning("USE_NGROK=true but pyngrok is not installed. Skipping.")
         return
-
     try:
-        port = int(os.environ.get("FLASK_PORT", "8080"))
-    except Exception:
-        port = 8080
-
-    token = os.environ.get("NGROK_AUTHTOKEN")
-    if token:
-        try:
-            ngrok_lib.set_auth_token(token)
-        except Exception as e:
-            logging.error("Failed to set ngrok auth token: %s", e)
-
-    try:
-        # Prefer TLS so PUBLIC_BASE_URL is https://...
-        tunnel = ngrok_lib.connect(addr=port, proto="http", bind_tls=True)
-        public_url = getattr(tunnel, "public_url", "") or ""
-        _active_tunnel_url = public_url
-        if public_url:
-            os.environ["PUBLIC_BASE_URL"] = public_url
-            _reload_runtime_from_env()
-            logging.info("ngrok tunnel established at %s", public_url)
-        else:
-            logging.error("ngrok did not return a public URL.")
+        if _active_tunnel_url:
+            return
+        port = _runtime.flask_port or 8080
+        tun = ngrok_lib.connect(addr=port, proto="http")
+        _active_tunnel_url = tun.public_url  # type: ignore
+        os.environ["PUBLIC_BASE_URL"] = _active_tunnel_url
+        _runtime.public_base_url = _active_tunnel_url
+        logging.info("ngrok tunnel active at %s", _active_tunnel_url)
     except Exception as e:
-        logging.error("Failed to start ngrok tunnel: %s", e)
+        logging.error("Failed to start ngrok: %s", e)
 
 
 @atexit.register
@@ -773,28 +831,28 @@ def _shutdown_ngrok():
     except Exception:
         pass
 
-
 # -----------------------------------------------------------------------------
 # Lifecycle and process control
 # -----------------------------------------------------------------------------
 
-def _handle_sigterm(signum, frame):
-    logging.info("Termination requested, shutting down dialer loop.")
-    _stop_requested.set()
+def _handle_termination(signum, frame):
+    logging.info("Termination signal received (%s). Stopping service.", signum)
+    try:
+        _stop_requested.set()
+    except Exception:
+        pass
 
-
-signal.signal(signal.SIGTERM, _handle_sigterm)
-signal.signal(signal.SIGINT, _handle_sigterm)
-
+signal.signal(signal.SIGTERM, _handle_termination)
+signal.signal(signal.SIGINT, _handle_termination)
 
 def _start_background_threads() -> None:
     if not _dialer_thread.is_alive():
         _dialer_thread.start()
 
-
 # -----------------------------------------------------------------------------
 # CLI entrypoint
 # -----------------------------------------------------------------------------
+
 def main():
     logging.info("Scam Call Console starting.")
 
@@ -804,9 +862,11 @@ def main():
     # Start background dialer
     _start_background_threads()
 
-    host = os.environ.get("FLASK_HOST", "0.0.0.0")
-    port = int(os.environ.get("FLASK_PORT", "8080"))
-    debug = (_parse_bool(os.environ.get("FLASK_DEBUG"), False))
+    host = _runtime.flask_host or os.environ.get("FLASK_HOST", "0.0.0.0")
+    port = int(_runtime.flask_port or _parse_int(os.environ.get("FLASK_PORT"), 8080))
+    debug = bool(_runtime.flask_debug or _parse_bool(os.environ.get("FLASK_DEBUG"), False))
+
+    # Important: disable reloader so SIGINT/SIGTERM reach this process directly
     app.run(host=host, port=port, debug=debug, use_reloader=False)
 
 
