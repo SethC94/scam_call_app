@@ -15,6 +15,47 @@
     }, durationMs);
   }
 
+  // Format seconds to mm:ss
+  function formatMMSS(totalSeconds) {
+    const s = Math.max(0, Math.floor(totalSeconds || 0));
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    const mm = String(m).padStart(2, "0");
+    const ss = String(r).padStart(2, "0");
+    return `${mm}:${ss}`;
+  }
+
+  // Build a compact countdown visual (inline SVG ring + text)
+  function buildCountdownBadge(remainSec, totalSec) {
+    const size = 34;
+    const stroke = 4;
+    const r = (size - stroke) / 2;
+    const c = 2 * Math.PI * r;
+    let pct = 0;
+    if (totalSec && totalSec > 0) {
+      const elapsed = Math.max(0, totalSec - Math.max(0, remainSec));
+      pct = Math.max(0, Math.min(1, elapsed / totalSec));
+    }
+    const dash = `${(c * pct).toFixed(2)} ${c.toFixed(2)}`;
+
+    const svg =
+      `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" aria-hidden="true" style="display:block">
+        <circle cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke="rgba(255,255,255,0.15)" stroke-width="${stroke}" />
+        <circle cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke="var(--accent, #25c2a0)" stroke-width="${stroke}"
+                stroke-linecap="round" stroke-dasharray="${dash}" transform="rotate(-90 ${size / 2} ${size / 2})" />
+      </svg>`;
+
+    const label = `<div style="display:flex;align-items:center;gap:.5rem">
+        <div style="width:${size}px;height:${size}px">${svg}</div>
+        <div>
+          <div style="line-height:1; font-weight:600; color:var(--text,#f3f5f7)">Next attempt</div>
+          <div style="line-height:1.2; color:var(--muted,#aab2bd); font-variant-numeric: tabular-nums;">in ${formatMMSS(remainSec)}</div>
+        </div>
+      </div>`;
+
+    return label;
+  }
+
   // Greeting modal logic
   const greetingModal = {
     el: null,
@@ -73,7 +114,7 @@
           const msg = await safeErrorText(res);
           throw new Error(msg || "Failed to save greeting phrase.");
         }
-        showToast("Greeting phrase queued for next call.");
+        showToast("Greeting phrase queued for the next call.");
         greetingModal.close();
       } catch (err) {
         showToast(err.message || "Failed to save greeting phrase.");
@@ -99,12 +140,12 @@
       try {
         const res = await fetch("/api/call-now", { method: "POST" });
         if (res.status === 429) {
-          showToast("Max calls reached in alloted time. Dont over scam the scammer!");
+          showToast("Maximum call attempts reached for the allotted time.");
           return;
         }
         const data = await res.json().catch(() => ({}));
         if (data && data.ok === false && data.reason === "cap_reached") {
-          showToast("Max calls reached in alloted time. Dont over scam the scammer!");
+          showToast("Maximum call attempts reached for the allotted time.");
           return;
         }
         if (res.ok) {
@@ -259,10 +300,76 @@
     qs("#btnSaveEnv")?.addEventListener("click", saveEnvEditor);
   }
 
+  // Status poller and renderer
+  let statusTimer = null;
+
+  function renderStatus(data) {
+    const area = qs("#statusArea");
+    if (!area) return;
+
+    const parts = [];
+
+    // Active window indicator
+    if (data.within_active_window) {
+      parts.push(`<div class="chip" style="display:inline-flex;align-items:center;gap:.5rem;padding:.3rem .55rem;border:1px solid var(--border);border-radius:999px;background:rgba(0,0,0,.2);">
+        <span style="width:.5rem;height:.5rem;border-radius:50%;background:var(--accent,#25c2a0);display:inline-block"></span>
+        <span>Active window</span>
+      </div>`);
+    } else {
+      parts.push(`<div class="chip" style="display:inline-flex;align-items:center;gap:.5rem;padding:.3rem .55rem;border:1px solid var(--border);border-radius:999px;background:rgba(0,0,0,.2);">
+        <span style="width:.5rem;height:.5rem;border-radius:50%;background:#e55353;display:inline-block"></span>
+        <span>Inactive now (hours ${escapeHtml(data.active_hours_local || "")})</span>
+      </div>`);
+    }
+
+    // Attempts info
+    parts.push(`<span class="muted" style="margin-left:.5rem">Attempts (1h/day): ${data.attempts_last_hour}/${data.hourly_max_attempts} · ${data.attempts_last_day}/${data.daily_max_attempts}</span>`);
+
+    // Countdown or cap wait
+    let countdownHtml = "";
+    if (!data.can_attempt_now && data.wait_seconds_if_capped > 0) {
+      countdownHtml = `<div style="margin-top:.5rem">${buildCountdownBadge(data.wait_seconds_if_capped, data.wait_seconds_if_capped)}</div>`;
+    } else if (typeof data.seconds_until_next === "number" && data.seconds_until_next != null) {
+      const total = (typeof data.interval_total_seconds === "number" && data.interval_total_seconds > 0)
+        ? data.interval_total_seconds
+        : (data.seconds_until_next || 0);
+      countdownHtml = `<div style="margin-top:.5rem">${buildCountdownBadge(data.seconds_until_next, total)}</div>`;
+    } else {
+      countdownHtml = `<div class="muted" style="margin-top:.5rem">Scheduling information is not available.</div>`;
+    }
+
+    area.innerHTML = `${parts.join(" ")} ${countdownHtml}`;
+  }
+
+  async function pollStatusOnce() {
+    try {
+      const res = await fetch("/api/status", { method: "GET", cache: "no-cache" });
+      if (!res.ok) throw new Error(await safeErrorText(res) || "Failed to load status.");
+      const data = await res.json();
+      renderStatus(data);
+    } catch (err) {
+      const area = qs("#statusArea");
+      if (area) {
+        area.innerHTML = `<div class="muted">Status unavailable.</div>`;
+      }
+    }
+  }
+
+  function initStatusPoll() {
+    pollStatusOnce();
+    clearInterval(statusTimer);
+    statusTimer = setInterval(pollStatusOnce, 1000);
+    // Update immediately on visibility changes to keep clock sharp when tab is refocused
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) pollStatusOnce();
+    });
+  }
+
   // Initialize all UI parts after DOM ready
   document.addEventListener("DOMContentLoaded", () => {
     initGreetingModal();
     initCallNow();
     initAdminPanel();
+    initStatusPoll();
   });
 })();
