@@ -15,22 +15,21 @@
     }, durationMs);
   }
 
-  // Format seconds to mm:ss
   function formatMMSS(totalSeconds) {
     const s = Math.max(0, Math.floor(totalSeconds || 0));
     const m = Math.floor(s / 60);
     const r = s % 60;
-    const mm = String(m).padStart(2, "0");
-    const ss = String(r).padStart(2, "0");
-    return `${mm}:${ss}`;
+    return `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
   }
 
-  // Build a compact countdown visual (inline SVG ring + text)
+  // Larger focal countdown badge
   function buildCountdownBadge(remainSec, totalSec) {
-    const size = 34;
-    const stroke = 4;
+    // Larger size for focal point
+    const size = 112; // px
+    const stroke = 8;
     const r = (size - stroke) / 2;
     const c = 2 * Math.PI * r;
+
     let pct = 0;
     if (totalSec && totalSec > 0) {
       const elapsed = Math.max(0, totalSec - Math.max(0, remainSec));
@@ -40,20 +39,12 @@
 
     const svg =
       `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" aria-hidden="true" style="display:block">
-        <circle cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke="rgba(255,255,255,0.15)" stroke-width="${stroke}" />
+        <circle cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="${stroke}" />
         <circle cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke="var(--accent, #25c2a0)" stroke-width="${stroke}"
                 stroke-linecap="round" stroke-dasharray="${dash}" transform="rotate(-90 ${size / 2} ${size / 2})" />
       </svg>`;
 
-    const label = `<div style="display:flex;align-items:center;gap:.5rem">
-        <div style="width:${size}px;height:${size}px">${svg}</div>
-        <div>
-          <div style="line-height:1; font-weight:600; color:var(--text,#f3f5f7)">Next attempt</div>
-          <div style="line-height:1.2; color:var(--muted,#aab2bd); font-variant-numeric: tabular-nums;">in ${formatMMSS(remainSec)}</div>
-        </div>
-      </div>`;
-
-    return label;
+    return svg;
   }
 
   // Greeting modal logic
@@ -131,7 +122,6 @@
     }
   }
 
-  // Call now logic with cap handling
   function initCallNow() {
     const btn = qs("#btnCallNow");
     if (!btn) return;
@@ -303,42 +293,82 @@
   // Status poller and renderer
   let statusTimer = null;
 
+  function renderNumbersLine(data) {
+    const to = data.to_number || "";
+    const fromSingle = data.from_number || "";
+    const fromPool = Array.isArray(data.from_numbers) ? data.from_numbers : [];
+
+    let fromText = "";
+    if (fromPool && fromPool.length > 0) {
+      const example = fromPool[0] || "";
+      const extra = Math.max(0, fromPool.length - 1);
+      fromText = extra > 0 ? `${example} (+${extra} more)` : example;
+    } else if (fromSingle) {
+      fromText = fromSingle;
+    } else {
+      fromText = "Not configured";
+    }
+
+    const toText = to || "Not configured";
+
+    return `<div class="muted" style="font-size:.95rem; margin-top:.5rem">
+      To: <span style="opacity:.9">${escapeHtml(toText)}</span>
+      &nbsp;&nbsp; From: <span style="opacity:.9">${escapeHtml(fromText)}</span>
+    </div>`;
+  }
+
   function renderStatus(data) {
     const area = qs("#statusArea");
     if (!area) return;
 
     const parts = [];
 
-    // Active window indicator
+    // Active window indicator and attempts
     if (data.within_active_window) {
-      parts.push(`<div class="chip" style="display:inline-flex;align-items:center;gap:.5rem;padding:.3rem .55rem;border:1px solid var(--border);border-radius:999px;background:rgba(0,0,0,.2);">
-        <span style="width:.5rem;height:.5rem;border-radius:50%;background:var(--accent,#25c2a0);display:inline-block"></span>
+      parts.push(`<div class="chip" style="display:inline-flex;align-items:center;gap:.5rem;padding:.35rem .6rem;border:1px solid var(--border);border-radius:999px;background:rgba(0,0,0,.2);">
+        <span style="width:.55rem;height:.55rem;border-radius:50%;background:var(--accent,#25c2a0);display:inline-block"></span>
         <span>Active window</span>
       </div>`);
     } else {
-      parts.push(`<div class="chip" style="display:inline-flex;align-items:center;gap:.5rem;padding:.3rem .55rem;border:1px solid var(--border);border-radius:999px;background:rgba(0,0,0,.2);">
-        <span style="width:.5rem;height:.5rem;border-radius:50%;background:#e55353;display:inline-block"></span>
+      parts.push(`<div class="chip" style="display:inline-flex;align-items:center;gap:.5rem;padding:.35rem .6rem;border:1px solid var(--border);border-radius:999px;background:rgba(0,0,0,.2);">
+        <span style="width:.55rem;height:.55rem;border-radius:50%;background:#e55353;display:inline-block"></span>
         <span>Inactive now (hours ${escapeHtml(data.active_hours_local || "")})</span>
       </div>`);
     }
 
-    // Attempts info
-    parts.push(`<span class="muted" style="margin-left:.5rem">Attempts (1h/day): ${data.attempts_last_hour}/${data.hourly_max_attempts} · ${data.attempts_last_day}/${data.daily_max_attempts}</span>`);
+    parts.push(`<span class="muted" style="margin-left:.6rem">Attempts (1h/day): ${data.attempts_last_hour}/${data.hourly_max_attempts} · ${data.attempts_last_day}/${data.daily_max_attempts}</span>`);
 
-    // Countdown or cap wait
-    let countdownHtml = "";
+    // Countdown panel as focal point
+    let remain = 0;
+    let total = 0;
     if (!data.can_attempt_now && data.wait_seconds_if_capped > 0) {
-      countdownHtml = `<div style="margin-top:.5rem">${buildCountdownBadge(data.wait_seconds_if_capped, data.wait_seconds_if_capped)}</div>`;
+      remain = data.wait_seconds_if_capped;
+      total = data.wait_seconds_if_capped;
     } else if (typeof data.seconds_until_next === "number" && data.seconds_until_next != null) {
-      const total = (typeof data.interval_total_seconds === "number" && data.interval_total_seconds > 0)
+      remain = data.seconds_until_next;
+      total = (typeof data.interval_total_seconds === "number" && data.interval_total_seconds > 0)
         ? data.interval_total_seconds
-        : (data.seconds_until_next || 0);
-      countdownHtml = `<div style="margin-top:.5rem">${buildCountdownBadge(data.seconds_until_next, total)}</div>`;
+        : data.seconds_until_next || 0;
     } else {
-      countdownHtml = `<div class="muted" style="margin-top:.5rem">Scheduling information is not available.</div>`;
+      remain = 0;
+      total = 0;
     }
 
-    area.innerHTML = `${parts.join(" ")} ${countdownHtml}`;
+    const svg = buildCountdownBadge(remain, total);
+    const labelBlock =
+      `<div style="display:flex;flex-direction:column;justify-content:center">
+        <div style="font-size:1.05rem; line-height:1; font-weight:600; color:var(--text,#f3f5f7);">Next attempt</div>
+        <div style="font-size:1.6rem; line-height:1.2; font-variant-numeric: tabular-nums; color:var(--muted,#aab2bd);">in ${formatMMSS(remain)}</div>
+        ${renderNumbersLine(data)}
+      </div>`;
+
+    const focal =
+      `<div style="display:flex;align-items:center;gap:1rem;margin-top:.9rem">
+        <div style="flex:0 0 auto">${svg}</div>
+        <div style="flex:1 1 auto">${labelBlock}</div>
+      </div>`;
+
+    area.innerHTML = `${parts.join(" ")} ${focal}`;
   }
 
   async function pollStatusOnce() {
@@ -359,13 +389,11 @@
     pollStatusOnce();
     clearInterval(statusTimer);
     statusTimer = setInterval(pollStatusOnce, 1000);
-    // Update immediately on visibility changes to keep clock sharp when tab is refocused
     document.addEventListener("visibilitychange", () => {
       if (!document.hidden) pollStatusOnce();
     });
   }
 
-  // Initialize all UI parts after DOM ready
   document.addEventListener("DOMContentLoaded", () => {
     initGreetingModal();
     initCallNow();
