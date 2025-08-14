@@ -15,6 +15,12 @@
     }, durationMs);
   }
 
+  function escapeHtml(s) {
+    return (s || "").replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
+    }[c]));
+  }
+
   function formatMMSS(totalSeconds) {
     const s = Math.max(0, Math.floor(totalSeconds || 0));
     const m = Math.floor(s / 60);
@@ -22,10 +28,9 @@
     return `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
   }
 
-  // Larger focal countdown badge
+  // Countdown badge
   function buildCountdownBadge(remainSec, totalSec) {
-    // Increased size for better visibility
-    const size = 168; // px
+    const size = 168;
     const stroke = 10;
     const r = (size - stroke) / 2;
     const c = 2 * Math.PI * r;
@@ -43,11 +48,10 @@
         <circle cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke="var(--accent, #25c2a0)" stroke-width="${stroke}"
                 stroke-linecap="round" stroke-dasharray="${dash}" transform="rotate(-90 ${size / 2} ${size / 2})" />
       </svg>`;
-
     return svg;
   }
 
-  // Greeting modal logic
+  // Greeting modal
   const greetingModal = {
     el: null,
     input: null,
@@ -152,7 +156,7 @@
     });
   }
 
-  // Admin environment editor
+  // Admin env editor
   function renderEnvTable(items) {
     const container = qs("#envEditor");
     if (!container) return;
@@ -194,7 +198,7 @@
         input.step = "1";
         input.min = "0";
         input.value = String(row.value ?? "");
-      } else if (row.key === "ROTATE_PROMPTS" || row.key === "USE_NGROK" || row.key === "NONINTERACTIVE" || row.key === "LOG_COLOR") {
+      } else if (row.key === "ROTATE_PROMPTS" || row.key === "USE_NGROK" || row.key === "NONINTERACTIVE" || row.key === "LOG_COLOR" || row.key === "ENABLE_MEDIA_STREAMS") {
         input = document.createElement("select");
         ["true", "false"].forEach((v) => {
           const opt = document.createElement("option");
@@ -277,12 +281,6 @@
     }
   }
 
-  function escapeHtml(s) {
-    return (s || "").replace(/[&<>"']/g, (c) => ({
-      "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
-    }[c]));
-  }
-
   function initAdminPanel() {
     const isAdmin = document.body.getAttribute("data-is-admin") === "1";
     if (!isAdmin) return;
@@ -311,7 +309,6 @@
 
     const toText = to || "Not configured";
 
-    // Subtle, readable display of the configured phone numbers
     return `<div class="muted" style="font-size:.9rem; margin-top:.5rem; color:var(--muted,#aab2bd);">
       To: <span style="opacity:.8; font-variant-numeric: tabular-nums;">${escapeHtml(toText)}</span>
       &nbsp;&nbsp; From: <span style="opacity:.8; font-variant-numeric: tabular-nums;">${escapeHtml(fromText)}</span>
@@ -324,7 +321,6 @@
 
     const parts = [];
 
-    // Active window indicator and attempts
     if (data.within_active_window) {
       parts.push(`<div class="chip" style="display:inline-flex;align-items:center;gap:.5rem;padding:.35rem .6rem;border:1px solid var(--border);border-radius:999px;background:rgba(0,0,0,.2);">
         <span style="width:.55rem;height:.55rem;border-radius:50%;background:var(--accent,#25c2a0);display:inline-block"></span>
@@ -339,7 +335,6 @@
 
     parts.push(`<span class="muted" style="margin-left:.6rem">Attempts (1h/day): ${data.attempts_last_hour}/${data.hourly_max_attempts} · ${data.attempts_last_day}/${data.daily_max_attempts}</span>`);
 
-    // Countdown panel as focal point
     let remain = 0;
     let total = 0;
     if (!data.can_attempt_now && data.wait_seconds_if_capped > 0) {
@@ -350,9 +345,6 @@
       total = (typeof data.interval_total_seconds === "number" && data.interval_total_seconds > 0)
         ? data.interval_total_seconds
         : data.seconds_until_next || 0;
-    } else {
-      remain = 0;
-      total = 0;
     }
 
     const svg = buildCountdownBadge(remain, total);
@@ -378,7 +370,7 @@
       if (!res.ok) throw new Error(await safeErrorText(res) || "Failed to load status.");
       const data = await res.json();
       renderStatus(data);
-    } catch (err) {
+    } catch {
       const area = qs("#statusArea");
       if (area) {
         area.innerHTML = `<div class="muted">Status unavailable.</div>`;
@@ -395,10 +387,189 @@
     });
   }
 
+  // Live conversation UI
+  let liveTimer = null;
+  let ws = null;
+  let audioCtx = null;
+  let scriptNode = null;
+  let audioQueue = [];
+  let playing = false;
+
+  function ensureLivePanel() {
+    let panel = qs("#livePanel");
+    if (panel) return panel;
+    const main = qs("main") || document.body;
+    panel = document.createElement("section");
+    panel.id = "livePanel";
+    panel.className = "panel";
+    panel.innerHTML = `
+      <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;gap:1rem">
+        <h2 class="panel-title">Live Conversation</h2>
+        <div style="display:flex;align-items:center;gap:.5rem">
+          <button id="btnListenLive" class="btn" disabled>Listen live</button>
+          <span id="listenStatus" class="muted" aria-live="polite"></span>
+        </div>
+      </div>
+      <div id="liveConversation" class="conversation" style="min-height:140px"></div>
+    `;
+    main.appendChild(panel);
+    return panel;
+  }
+
+  function appendTranscriptEntry(container, entry) {
+    const role = entry.role || "Speaker";
+    const text = entry.text || "";
+    const line = document.createElement("div");
+    line.className = "conv-line";
+    line.innerHTML = `<span class="conv-role ${role === "Assistant" ? "assistant" : "callee"}">${escapeHtml(role)}:</span> <span class="conv-text">${escapeHtml(text)}</span>`;
+    container.appendChild(line);
+    container.scrollTop = container.scrollHeight;
+  }
+
+  async function pollLiveTranscript() {
+    try {
+      const res = await fetch("/api/live", { method: "GET", cache: "no-cache" });
+      if (!res.ok) return;
+      const data = await res.json();
+      const container = qs("#liveConversation");
+      const btn = qs("#btnListenLive");
+      const status = qs("#listenStatus");
+      if (!container || !btn || !status) return;
+
+      // Enable/disable Listen button based on server feature flag
+      btn.disabled = !data.in_progress || !data.media_streams_enabled;
+
+      // Simple rendering: redraw if counts changed
+      const prevCount = Number(container.getAttribute("data-count") || "0");
+      const list = Array.isArray(data.transcript) ? data.transcript : [];
+      if (list.length !== prevCount) {
+        container.innerHTML = "";
+        list.forEach((e) => appendTranscriptEntry(container, e));
+        container.setAttribute("data-count", String(list.length));
+      }
+
+      if (!data.in_progress && ws) {
+        stopListening();
+      }
+    } catch {
+      // ignore transient errors
+    }
+  }
+
+  function initLivePanel() {
+    const panel = ensureLivePanel();
+    const btn = qs("#btnListenLive", panel);
+    btn?.addEventListener("click", () => {
+      if (ws) {
+        stopListening();
+      } else {
+        startListening();
+      }
+    });
+    clearInterval(liveTimer);
+    liveTimer = setInterval(pollLiveTranscript, 1000);
+    pollLiveTranscript();
+  }
+
+  // Audio handling (PCMU 8kHz decoding)
+  function mulawDecodeSample(mu) {
+    const MULAW_MAX = 0x1FFF;
+    const MULAW_BIAS = 33;
+    mu = ~mu & 0xff;
+    let sign = (mu & 0x80) ? -1 : 1;
+    let exponent = (mu >> 4) & 0x07;
+    let mantissa = mu & 0x0f;
+    let sample = ((mantissa << 4) + 8) << (exponent + 3);
+    sample = sign * (sample - MULAW_BIAS);
+    return sample / 32768;
+  }
+
+  function decodeMuLaw(payloadB64) {
+    const bin = atob(payloadB64);
+    const out = new Float32Array(bin.length);
+    for (let i = 0; i < bin.length; i++) {
+      out[i] = mulawDecodeSample(bin.charCodeAt(i));
+    }
+    return out;
+  }
+
+  function audioProcess() {
+    if (!playing || !scriptNode) return;
+    const out = scriptNode.outputBuffer.getChannelData(0);
+    out.fill(0);
+    if (audioQueue.length === 0) return;
+    const chunk = audioQueue.shift();
+    if (!chunk) return;
+    const n = Math.min(out.length, chunk.length);
+    out.set(chunk.subarray(0, n), 0);
+    if (chunk.length > n) {
+      audioQueue.unshift(chunk.subarray(n));
+    }
+  }
+
+  function startListening() {
+    const status = qs("#listenStatus");
+    const btn = qs("#btnListenLive");
+    try {
+      const scheme = location.protocol === "https:" ? "wss" : "ws";
+      ws = new WebSocket(`${scheme}://${location.host}/client-audio`);
+      ws.onopen = () => {
+        if (!audioCtx) {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 8000 });
+          scriptNode = audioCtx.createScriptProcessor(2048, 0, 1);
+          scriptNode.onaudioprocess = audioProcess;
+          scriptNode.connect(audioCtx.destination);
+        }
+        playing = true;
+        status.textContent = "Connected";
+        btn.textContent = "Stop listening";
+      };
+      ws.onmessage = (ev) => {
+        const payloadB64 = ev.data;
+        const pcm = decodeMuLaw(payloadB64);
+        audioQueue.push(pcm);
+      };
+      ws.onclose = () => {
+        playing = false;
+        status.textContent = "Disconnected";
+        btn.textContent = "Listen live";
+        ws = null;
+      };
+      ws.onerror = () => {
+        playing = false;
+        status.textContent = "Audio error";
+        btn.textContent = "Listen live";
+        try { ws && ws.close(); } catch {}
+        ws = null;
+      };
+    } catch {
+      status.textContent = "Audio not available";
+      btn.textContent = "Listen live";
+      ws = null;
+    }
+  }
+
+  function stopListening() {
+    const btn = qs("#btnListenLive");
+    const status = qs("#listenStatus");
+    try { ws && ws.close(); } catch {}
+    ws = null;
+    playing = false;
+    if (status) status.textContent = "Stopped";
+    if (btn) btn.textContent = "Listen live";
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden && ws) {
+      stopListening();
+    }
+  });
+
   document.addEventListener("DOMContentLoaded", () => {
     initGreetingModal();
     initCallNow();
     initAdminPanel();
     initStatusPoll();
+    initLivePanel();
   });
 })();
