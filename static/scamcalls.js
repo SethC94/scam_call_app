@@ -4,15 +4,45 @@
   const qs = (sel, ctx = document) => ctx.querySelector(sel);
   const qsa = (sel, ctx = document) => Array.from(ctx.querySelectorAll(sel));
 
+  // Inject small CSS for the live panel blackout when active
+  (function ensureStyle() {
+    const id = "live-convo-style";
+    if (qs(`#${id}`)) return;
+    const style = document.createElement("style");
+    style.id = id;
+    style.textContent = `
+      #livePanel .conversation {
+        transition: background-color .25s ease, box-shadow .25s ease, border-color .25s ease;
+      }
+      #livePanel.active .conversation {
+        background-color: rgba(0,0,0,0.78);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 12px;
+        padding: 12px 14px;
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02), 0 10px 30px rgba(0,0,0,0.35);
+      }
+      #livePanel .conv-line {
+        margin: .25rem 0;
+        line-height: 1.35;
+      }
+      #livePanel .conv-role {
+        font-weight: 600;
+        margin-right: .4rem;
+      }
+      #livePanel .conv-role.assistant { color: #7ec8ff; }
+      #livePanel .conv-role.callee { color: #ffd27e; }
+      #listenStatus { min-width: 9ch; text-align: right; }
+    `;
+    document.head.appendChild(style);
+  })();
+
   function showToast(message, durationMs = 3200) {
     const el = qs("#toast");
     if (!el) return;
     el.textContent = message;
     el.classList.add("toast--show");
     clearTimeout(showToast._t);
-    showToast._t = setTimeout(() => {
-      el.classList.remove("toast--show");
-    }, durationMs);
+    showToast._t = setTimeout(() => el.classList.remove("toast--show"), durationMs);
   }
 
   function escapeHtml(s) {
@@ -28,8 +58,8 @@
     return `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
   }
 
-  // Countdown badge
-  function buildCountdownBadge(remainSec, totalSec) {
+  // Countdown ring (SVG)
+  function buildCountdownBadge(remainSec, totalSec, paused) {
     const size = 168;
     const stroke = 10;
     const r = (size - stroke) / 2;
@@ -41,32 +71,21 @@
       pct = Math.max(0, Math.min(1, elapsed / totalSec));
     }
     const dash = `${(c * pct).toFixed(2)} ${c.toFixed(2)}`;
+    const ringColor = paused ? "#8892a6" : "var(--accent, #25c2a0)";
 
-    const svg =
-      `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" aria-hidden="true" style="display:block">
+    return `
+      <svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" aria-hidden="true" style="display:block">
         <circle cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="${stroke}" />
-        <circle cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke="var(--accent, #25c2a0)" stroke-width="${stroke}"
+        <circle cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke="${ringColor}" stroke-width="${stroke}"
                 stroke-linecap="round" stroke-dasharray="${dash}" transform="rotate(-90 ${size / 2} ${size / 2})" />
       </svg>`;
-    return svg;
   }
 
   // Greeting modal
   const greetingModal = {
-    el: null,
-    input: null,
-    wordCountEl: null,
-    saveBtn: null,
-    open() {
-      this.el.setAttribute("aria-hidden", "false");
-      this.input.focus();
-      this.updateWordCount();
-    },
-    close() {
-      this.el.setAttribute("aria-hidden", "true");
-      this.input.value = "";
-      this.updateWordCount();
-    },
+    el: null, input: null, wordCountEl: null, saveBtn: null,
+    open() { this.el.setAttribute("aria-hidden", "false"); this.input.focus(); this.updateWordCount(); },
+    close() { this.el.setAttribute("aria-hidden", "true"); this.input.value = ""; this.updateWordCount(); },
     getWordCount() {
       const text = (this.input.value || "").trim();
       if (!text) return 0;
@@ -105,25 +124,13 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ phrase }),
         });
-        if (!res.ok) {
-          const msg = await safeErrorText(res);
-          throw new Error(msg || "Failed to save greeting phrase.");
-        }
+        if (!res.ok) throw new Error((await res.text()) || "Failed to save greeting phrase.");
         showToast("Greeting phrase queued for the next call.");
         greetingModal.close();
       } catch (err) {
         showToast(err.message || "Failed to save greeting phrase.");
       }
     });
-  }
-
-  async function safeErrorText(res) {
-    try {
-      const t = await res.text();
-      return t && t.length < 500 ? t : "";
-    } catch {
-      return "";
-    }
   }
 
   function initCallNow() {
@@ -133,20 +140,15 @@
       btn.disabled = true;
       try {
         const res = await fetch("/api/call-now", { method: "POST" });
-        if (res.status === 429) {
-          showToast("Maximum call attempts reached for the allotted time.");
-          return;
-        }
         const data = await res.json().catch(() => ({}));
-        if (data && data.ok === false && data.reason === "cap_reached") {
+        if (res.status === 429 || (data && data.reason === "cap_reached")) {
           showToast("Maximum call attempts reached for the allotted time.");
           return;
         }
-        if (res.ok) {
+        if (data && data.ok) {
           showToast("Call attempt requested.");
         } else {
-          const msg = data && data.message ? data.message : await safeErrorText(res);
-          showToast(msg || "Call request failed.");
+          showToast((data && data.message) || "Call request failed.");
         }
       } catch (err) {
         showToast(err.message || "Call request failed.");
@@ -156,18 +158,34 @@
     });
   }
 
-  // Admin env editor
+  // Admin panel
+  async function loadEnvEditor() {
+    const container = qs("#envEditor");
+    const isAdmin = document.body.getAttribute("data-is-admin") === "1";
+    if (!container || !isAdmin) return;
+    const endpoint = container.getAttribute("data-endpoint-get") || "/api/admin/env";
+    container.setAttribute("aria-busy", "true");
+    try {
+      const res = await fetch(endpoint, { method: "GET" });
+      if (!res.ok) throw new Error((await res.text()) || "Failed to load settings.");
+      const data = await res.json();
+      renderEnvTable(data.editable || []);
+    } catch (err) {
+      container.innerHTML = `<div class="alert">Error: ${escapeHtml(err.message || "Failed to load settings.")}</div>`;
+    } finally {
+      container.removeAttribute("aria-busy");
+    }
+  }
+
   function renderEnvTable(items) {
     const container = qs("#envEditor");
     if (!container) return;
     container.innerHTML = "";
-
     const table = document.createElement("table");
     table.className = "env-table";
     const thead = document.createElement("thead");
     thead.innerHTML = "<tr><th style='width:28%'>Key</th><th>Value</th></tr>";
     table.appendChild(thead);
-
     const tbody = document.createElement("tbody");
     items.forEach((row) => {
       const tr = document.createElement("tr");
@@ -178,7 +196,6 @@
       keyLabel.textContent = row.key;
       keyLabel.style.fontFamily = "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
       keyLabel.style.fontSize = "0.95rem";
-
       tdKey.appendChild(keyLabel);
 
       let input;
@@ -198,7 +215,7 @@
         input.step = "1";
         input.min = "0";
         input.value = String(row.value ?? "");
-      } else if (row.key === "ROTATE_PROMPTS" || row.key === "USE_NGROK" || row.key === "NONINTERACTIVE" || row.key === "LOG_COLOR" || row.key === "ENABLE_MEDIA_STREAMS") {
+      } else if (["ROTATE_PROMPTS", "USE_NGROK", "NONINTERACTIVE", "LOG_COLOR", "ENABLE_MEDIA_STREAMS"].includes(row.key)) {
         input = document.createElement("select");
         ["true", "false"].forEach((v) => {
           const opt = document.createElement("option");
@@ -220,7 +237,6 @@
       tr.appendChild(tdVal);
       tbody.appendChild(tr);
     });
-
     table.appendChild(tbody);
     container.appendChild(table);
 
@@ -228,35 +244,10 @@
     if (saveBtn) saveBtn.disabled = false;
   }
 
-  async function loadEnvEditor() {
-    const container = qs("#envEditor");
-    const isAdmin = document.body.getAttribute("data-is-admin") === "1";
-    if (!container || !isAdmin) return;
-    const endpoint = container.getAttribute("data-endpoint-get") || "/api/admin/env";
-    container.setAttribute("aria-busy", "true");
-    try {
-      const res = await fetch(endpoint, { method: "GET" });
-      if (!res.ok) {
-        const msg = await safeErrorText(res);
-        throw new Error(msg || "Failed to load editable settings.");
-      }
-      const data = await res.json();
-      if (!data || !Array.isArray(data.editable)) {
-        throw new Error("Invalid response.");
-      }
-      renderEnvTable(data.editable);
-    } catch (err) {
-      container.innerHTML = `<div class="alert">Error: ${escapeHtml(err.message || "Failed to load settings.")}</div>`;
-    } finally {
-      container.removeAttribute("aria-busy");
-    }
-  }
-
   async function saveEnvEditor() {
     const container = qs("#envEditor");
     if (!container) return;
     const endpoint = container.getAttribute("data-endpoint-post") || "/api/admin/env";
-
     const inputs = qsa("input, select, textarea", container);
     const updates = {};
     inputs.forEach((el) => {
@@ -264,17 +255,13 @@
       if (!key) return;
       updates[key] = el.value;
     });
-
     try {
       const res = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ updates }),
       });
-      if (!res.ok) {
-        const msg = await safeErrorText(res);
-        throw new Error(msg || "Failed to save settings.");
-      }
+      if (!res.ok) throw new Error((await res.text()) || "Failed to save settings.");
       showToast("Settings saved.");
     } catch (err) {
       showToast(err.message || "Failed to save settings.");
@@ -288,9 +275,13 @@
     qs("#btnSaveEnv")?.addEventListener("click", saveEnvEditor);
   }
 
-  // Status poller and renderer
+  // Global UI state
   let statusTimer = null;
+  let liveTimer = null;
+  let callActive = false;
+  let autoCallInFlight = false;
 
+  // Status render
   function renderNumbersLine(data) {
     const to = data.to_number || "";
     const fromSingle = data.from_number || "";
@@ -308,7 +299,6 @@
     }
 
     const toText = to || "Not configured";
-
     return `<div class="muted" style="font-size:.9rem; margin-top:.5rem; color:var(--muted,#aab2bd);">
       To: <span style="opacity:.8; font-variant-numeric: tabular-nums;">${escapeHtml(toText)}</span>
       &nbsp;&nbsp; From: <span style="opacity:.8; font-variant-numeric: tabular-nums;">${escapeHtml(fromText)}</span>
@@ -319,12 +309,13 @@
     const area = qs("#statusArea");
     if (!area) return;
 
+    const paused = !!data.call_in_progress;
     const parts = [];
 
     if (data.within_active_window) {
       parts.push(`<div class="chip" style="display:inline-flex;align-items:center;gap:.5rem;padding:.35rem .6rem;border:1px solid var(--border);border-radius:999px;background:rgba(0,0,0,.2);">
         <span style="width:.55rem;height:.55rem;border-radius:50%;background:var(--accent,#25c2a0);display:inline-block"></span>
-        <span>Active window</span>
+        <span>${paused ? "Active call in progress" : "Active window"}</span>
       </div>`);
     } else {
       parts.push(`<div class="chip" style="display:inline-flex;align-items:center;gap:.5rem;padding:.35rem .6rem;border:1px solid var(--border);border-radius:999px;background:rgba(0,0,0,.2);">
@@ -335,23 +326,18 @@
 
     parts.push(`<span class="muted" style="margin-left:.6rem">Attempts (1h/day): ${data.attempts_last_hour}/${data.hourly_max_attempts} · ${data.attempts_last_day}/${data.daily_max_attempts}</span>`);
 
-    let remain = 0;
-    let total = 0;
-    if (!data.can_attempt_now && data.wait_seconds_if_capped > 0) {
-      remain = data.wait_seconds_if_capped;
-      total = data.wait_seconds_if_capped;
-    } else if (typeof data.seconds_until_next === "number" && data.seconds_until_next != null) {
-      remain = data.seconds_until_next;
-      total = (typeof data.interval_total_seconds === "number" && data.interval_total_seconds > 0)
-        ? data.interval_total_seconds
-        : data.seconds_until_next || 0;
-    }
+    // When paused, keep the ring static and label accordingly
+    let remain = data.seconds_until_next;
+    let total = data.interval_total_seconds || remain || 0;
 
-    const svg = buildCountdownBadge(remain, total);
+    const svg = buildCountdownBadge(remain ?? 0, total, paused);
+    const bigLabel = paused ? "Call in progress" : "Next attempt";
+    const smallLabel = paused ? "" : `in ${formatMMSS(remain ?? 0)}`;
+
     const labelBlock =
       `<div style="display:flex;flex-direction:column;justify-content:center">
-        <div style="font-size:1.05rem; line-height:1; font-weight:600; color:var(--text,#f3f5f7);">Next attempt</div>
-        <div style="font-size:1.6rem; line-height:1.2; font-variant-numeric: tabular-nums; color:var(--muted,#aab2bd);">in ${formatMMSS(remain)}</div>
+        <div style="font-size:1.05rem; line-height:1; font-weight:600; color:var(--text,#f3f5f7);">${bigLabel}</div>
+        <div style="font-size:1.6rem; line-height:1.2; font-variant-numeric: tabular-nums; color:var(--muted,#aab2bd);">${smallLabel}</div>
         ${renderNumbersLine(data)}
       </div>`;
 
@@ -364,17 +350,43 @@
     area.innerHTML = `${parts.join(" ")} ${focal}`;
   }
 
+  // Auto-call logic on countdown
+  async function maybeAutoCall(data) {
+    if (autoCallInFlight || callActive) return;
+    if (!data.within_active_window) return;
+    if (!data.can_attempt_now) return;
+    if (typeof data.seconds_until_next !== "number") return;
+    if (data.seconds_until_next > 0) return;
+
+    autoCallInFlight = true;
+    try {
+      const res = await fetch("/api/call-now", { method: "POST" });
+      if (!res.ok && res.status !== 409) {
+        // 409 means already in progress; anything else we show a brief toast
+        showToast("Auto-call attempt failed.");
+      }
+    } catch {
+      // Ignore transient failure
+    } finally {
+      autoCallInFlight = false;
+    }
+  }
+
   async function pollStatusOnce() {
     try {
       const res = await fetch("/api/status", { method: "GET", cache: "no-cache" });
-      if (!res.ok) throw new Error(await safeErrorText(res) || "Failed to load status.");
+      if (!res.ok) throw new Error(await res.text() || "Failed to load status.");
       const data = await res.json();
+      // While the live poll sets callActive more precisely, the status endpoint also carries call_in_progress.
+      // Prefer the live state when available; otherwise fall back to status flag.
+      if (typeof data.call_in_progress === "boolean" && callActive !== true) {
+        callActive = data.call_in_progress;
+      }
       renderStatus(data);
+      await maybeAutoCall(data);
     } catch {
       const area = qs("#statusArea");
-      if (area) {
-        area.innerHTML = `<div class="muted">Status unavailable.</div>`;
-      }
+      if (area) area.innerHTML = `<div class="muted">Status unavailable.</div>`;
     }
   }
 
@@ -388,7 +400,6 @@
   }
 
   // Live conversation UI
-  let liveTimer = null;
   let ws = null;
   let audioCtx = null;
   let scriptNode = null;
@@ -421,9 +432,40 @@
     const text = entry.text || "";
     const line = document.createElement("div");
     line.className = "conv-line";
+    line.setAttribute("data-role", role);
+    line.setAttribute("data-final", entry.final ? "1" : "0");
     line.innerHTML = `<span class="conv-role ${role === "Assistant" ? "assistant" : "callee"}">${escapeHtml(role)}:</span> <span class="conv-text">${escapeHtml(text)}</span>`;
     container.appendChild(line);
     container.scrollTop = container.scrollHeight;
+  }
+
+  // Merge logic: render all final entries, and keep only one updating partial callee line
+  function renderLiveTranscriptList(container, list) {
+    const finals = list.filter((e) => e && e.final);
+    const latestPartial = [...list].reverse().find((e) => e && !e.final);
+
+    const prevFinalCount = Number(container.getAttribute("data-final-count") || "0");
+    if (finals.length !== prevFinalCount) {
+      container.innerHTML = "";
+      finals.forEach((e) => appendTranscriptEntry(container, e));
+      container.setAttribute("data-final-count", String(finals.length));
+    }
+    // Update or add single partial line
+    let partialEl = qs(".conv-line[data-final='0']", container);
+    if (latestPartial && latestPartial.text) {
+      if (!partialEl) {
+        partialEl = document.createElement("div");
+        partialEl.className = "conv-line";
+        partialEl.setAttribute("data-final", "0");
+        partialEl.innerHTML = `<span class="conv-role callee">Callee:</span> <span class="conv-text"></span>`;
+        container.appendChild(partialEl);
+      }
+      qs(".conv-text", partialEl).textContent = latestPartial.text;
+      container.scrollTop = container.scrollHeight;
+    } else {
+      // No current partial -> remove if present
+      if (partialEl) partialEl.remove();
+    }
   }
 
   async function pollLiveTranscript() {
@@ -434,21 +476,21 @@
       const container = qs("#liveConversation");
       const btn = qs("#btnListenLive");
       const status = qs("#listenStatus");
-      if (!container || !btn || !status) return;
+      const panel = qs("#livePanel");
+      if (!container || !btn || !status || !panel) return;
 
-      // Enable/disable Listen button based on server feature flag
-      btn.disabled = !data.in_progress || !data.media_streams_enabled;
+      callActive = !!data.in_progress;
+      panel.classList.toggle("active", callActive);
 
-      // Simple rendering: redraw if counts changed
-      const prevCount = Number(container.getAttribute("data-count") || "0");
+      // Enable or disable Listen button based on feature flag and call state
+      btn.disabled = !callActive || !data.media_streams_enabled;
+
+      // Render merged transcript
       const list = Array.isArray(data.transcript) ? data.transcript : [];
-      if (list.length !== prevCount) {
-        container.innerHTML = "";
-        list.forEach((e) => appendTranscriptEntry(container, e));
-        container.setAttribute("data-count", String(list.length));
-      }
+      renderLiveTranscriptList(container, list);
 
-      if (!data.in_progress && ws) {
+      // Stop listening automatically when call ends
+      if (!callActive && ws) {
         stopListening();
       }
     } catch {
@@ -460,44 +502,55 @@
     const panel = ensureLivePanel();
     const btn = qs("#btnListenLive", panel);
     btn?.addEventListener("click", () => {
-      if (ws) {
-        stopListening();
-      } else {
-        startListening();
-      }
+      if (ws) stopListening();
+      else startListening();
     });
     clearInterval(liveTimer);
     liveTimer = setInterval(pollLiveTranscript, 1000);
     pollLiveTranscript();
   }
 
-  // Audio handling (PCMU 8kHz decoding)
+  // Audio handling with μ-law 8kHz -> AudioContext sample-rate conversion
   function mulawDecodeSample(mu) {
-    const MULAW_MAX = 0x1FFF;
-    const MULAW_BIAS = 33;
     mu = ~mu & 0xff;
-    let sign = (mu & 0x80) ? -1 : 1;
-    let exponent = (mu >> 4) & 0x07;
-    let mantissa = mu & 0x0f;
+    const sign = (mu & 0x80) ? -1 : 1;
+    const exponent = (mu >> 4) & 0x07;
+    const mantissa = mu & 0x0f;
     let sample = ((mantissa << 4) + 8) << (exponent + 3);
-    sample = sign * (sample - MULAW_BIAS);
-    return sample / 32768;
+    sample = sign * (sample - 33);
+    return Math.max(-1, Math.min(1, sample / 32768));
   }
 
-  function decodeMuLaw(payloadB64) {
+  function decodeMuLawToFloat32(payloadB64) {
     const bin = atob(payloadB64);
     const out = new Float32Array(bin.length);
     for (let i = 0; i < bin.length; i++) {
       out[i] = mulawDecodeSample(bin.charCodeAt(i));
     }
+    return out; // 8 kHz mono
+  }
+
+  function resampleToContextRate(src8k, contextRate) {
+    if (!src8k || src8k.length === 0) return src8k;
+    const srcRate = 8000;
+    if (contextRate === srcRate) return src8k;
+    const ratio = contextRate / srcRate;
+    const outLen = Math.max(1, Math.floor(src8k.length * ratio));
+    const out = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const srcPos = i / ratio;
+      const i0 = Math.floor(srcPos);
+      const i1 = Math.min(src8k.length - 1, i0 + 1);
+      const frac = srcPos - i0;
+      out[i] = src8k[i0] * (1 - frac) + src8k[i1] * frac;
+    }
     return out;
   }
 
-  function audioProcess() {
-    if (!playing || !scriptNode) return;
-    const out = scriptNode.outputBuffer.getChannelData(0);
+  function audioProcess(ev) {
+    const out = ev.outputBuffer.getChannelData(0);
     out.fill(0);
-    if (audioQueue.length === 0) return;
+    if (!playing || audioQueue.length === 0) return;
     const chunk = audioQueue.shift();
     if (!chunk) return;
     const n = Math.min(out.length, chunk.length);
@@ -510,41 +563,48 @@
   function startListening() {
     const status = qs("#listenStatus");
     const btn = qs("#btnListenLive");
+
+    // Only allow when enabled
+    if (btn && btn.disabled) return;
+
     try {
       const scheme = location.protocol === "https:" ? "wss" : "ws";
       ws = new WebSocket(`${scheme}://${location.host}/client-audio`);
-      ws.onopen = () => {
+      ws.onopen = async () => {
         if (!audioCtx) {
-          audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 8000 });
-          scriptNode = audioCtx.createScriptProcessor(2048, 0, 1);
+          // Use system default rate (often 44100 or 48000) and resample
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          try { await audioCtx.resume(); } catch {}
+          scriptNode = audioCtx.createScriptProcessor(4096, 0, 1);
           scriptNode.onaudioprocess = audioProcess;
           scriptNode.connect(audioCtx.destination);
         }
         playing = true;
-        status.textContent = "Connected";
-        btn.textContent = "Stop listening";
+        if (status) status.textContent = "Connected";
+        if (btn) btn.textContent = "Stop listening";
       };
       ws.onmessage = (ev) => {
         const payloadB64 = ev.data;
-        const pcm = decodeMuLaw(payloadB64);
+        const pcm8k = decodeMuLawToFloat32(payloadB64);
+        const pcm = resampleToContextRate(pcm8k, audioCtx ? audioCtx.sampleRate : 8000);
         audioQueue.push(pcm);
       };
       ws.onclose = () => {
         playing = false;
-        status.textContent = "Disconnected";
-        btn.textContent = "Listen live";
+        if (status) status.textContent = "Disconnected";
+        if (btn) btn.textContent = "Listen live";
         ws = null;
       };
       ws.onerror = () => {
         playing = false;
-        status.textContent = "Audio error";
-        btn.textContent = "Listen live";
+        if (status) status.textContent = "Audio error";
+        if (btn) btn.textContent = "Listen live";
         try { ws && ws.close(); } catch {}
         ws = null;
       };
     } catch {
-      status.textContent = "Audio not available";
-      btn.textContent = "Listen live";
+      if (status) status.textContent = "Audio not available";
+      if (btn) btn.textContent = "Listen live";
       ws = null;
     }
   }
@@ -560,11 +620,10 @@
   }
 
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden && ws) {
-      stopListening();
-    }
+    if (document.hidden && ws) stopListening();
   });
 
+  // Boot
   document.addEventListener("DOMContentLoaded", () => {
     initGreetingModal();
     initCallNow();
