@@ -1,3 +1,13 @@
 # Environment files
 .env*
-.env*
+
+# SQLite database (contains sensitive call data)
+scam_app.db
+
+# Temporary files
+*.tmp
+
+# Build artifacts
+*.pyc
+__pycache__/
+*.egg-info/
